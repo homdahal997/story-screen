@@ -1,24 +1,37 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
+import { DarkTheme, ThemeProvider } from '@react-navigation/native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import 'react-native-reanimated';
 
-import { useColorScheme } from '@/hooks/use-color-scheme';
+import { AuthProvider } from '@/src/context/AuthContext';
+import { colors } from '@/src/design-system/tokens';
 
-export const unstable_settings = {
-  anchor: '(tabs)',
+const FrameStudioTheme = {
+  ...DarkTheme,
+  colors: {
+    ...DarkTheme.colors,
+    background: colors.ink,
+    card: colors.graphite,
+    text: colors.bone,
+    border: colors.fog,
+    primary: colors.signal,
+  },
 };
 
 export default function RootLayout() {
-  const colorScheme = useColorScheme();
-
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
-      </Stack>
-      <StatusBar style="auto" />
-    </ThemeProvider>
+    <AuthProvider>
+      <ThemeProvider value={FrameStudioTheme}>
+        <StatusBar style="light" />
+        <Stack screenOptions={{ headerShown: false }}>
+          <Stack.Screen name="auth" />
+          <Stack.Screen name="(tabs)" />
+          <Stack.Screen name="create/[id]" />
+          <Stack.Screen name="create/assets" />
+          <Stack.Screen name="create/pipeline" />
+          <Stack.Screen name="project/[id]" />
+        </Stack>
+      </ThemeProvider>
+    </AuthProvider>
   );
 }
