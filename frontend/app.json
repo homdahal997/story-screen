@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "Frame Studio",
+    "slug": "frame-studio",
+    "description": "Cinematic Story Orchestration",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "framestudio",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "com.homihom.framestudio",
+      "buildNumber": "1",
+      "supportsTablet": false,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.homihom.framestudio",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0A0B"
+      }
+    },
+    "plugins": [
+      "expo-router",
+      "expo-video",
+      "expo-secure-store"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "d426e772-8571-418f-a5dc-1098135255a3"
+      }
+    },
+    "owner": "homihom"
+  }
+}
