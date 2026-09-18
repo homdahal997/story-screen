@@ -158,7 +158,7 @@ def serialize_episode(series: dict, ep: dict) -> dict:
     orientation = series.get("orientation", "vertical")
     characters, scenes = [], []
     if manifest:
-        voices = {v["character_id"]: v for v in ep.get("voice_assignments", [])}
+        voices = {v["character_id"]: v for v in _normalize_assignments(ep.get("voice_assignments", []), manifest)}
         for c in manifest["characters"]:
             asset = _asset(ep, "character_reference", character_id=c["id"])
             v = voices.get(c["id"])
@@ -385,6 +385,13 @@ async def gen_script(project_id: str, n: int, user: core.CurrentUser):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Script generation failed: {e}")
     ep = await ep_update(ep["id"], {"manifest": manifest, "status": "ASSETS"})
+    # Lock a distinct voice per character up-front (deterministic, single request
+    # -> no race). Best-effort: if voices can't be listed now, they are cast lazily.
+    try:
+        assignments = _cast_all_voices(series, manifest, [])
+        ep = await ep_update(ep["id"], {"voice_assignments": assignments})
+    except Exception:
+        pass
     return serialize_episode(series, ep)
 
 
@@ -548,31 +555,84 @@ def _infer_gender(profile: str) -> Optional[str]:
     return None
 
 
+def _normalize_assignments(assignments: list, manifest: Optional[dict]) -> list:
+    """One voice per character (latest updated_at wins); drop assignments whose
+    character is no longer in the manifest. Mirrors the reference
+    normalizeVoiceAssignments so duplicate/legacy records can never make a
+    character resolve to two different voices."""
+    valid = {c["id"] for c in (manifest or {}).get("characters", [])} if manifest else None
+    by_char: dict = {}
+    for v in assignments or []:
+        cid = v.get("character_id")
+        if not cid or not v.get("voice_id"):
+            continue
+        if valid is not None and cid not in valid:
+            continue
+        prev = by_char.get(cid)
+        if not prev or str(v.get("updated_at", "")) >= str(prev.get("updated_at", "")):
+            by_char[cid] = v
+    return list(by_char.values())
+
+
+def _cast_all_voices(series: dict, manifest: dict, existing: list) -> list:
+    """Deterministically assign ONE distinct locked voice per character.
+
+    The result is stable for a given series seed + character set and is
+    independent of call order or concurrency, so two requests can never derive
+    different voices for the same character. Any already-locked/overridden
+    assignment in `existing` is preserved."""
+    import random
+    pool = sorted(_voices(), key=lambda v: v["voice_id"])
+    buckets: dict = {"male": [], "female": [], "neutral": []}
+    for v in pool:
+        g = (v.get("gender") or "").lower()
+        buckets["female" if g == "female" else "male" if g == "male" else "neutral"].append(v)
+    rng = random.Random(series.get("seed", 0))
+    for b in buckets.values():
+        rng.shuffle(b)
+    result = list(existing)
+    locked = {a["character_id"] for a in existing}
+    used = {a["voice_id"] for a in existing}
+    for c in sorted(manifest["characters"], key=lambda x: x["id"]):
+        if c["id"] in locked:
+            continue
+        gender = _infer_gender(c.get("detailed_visual_profile", "")) or "neutral"
+        chosen = None
+        for name in (gender, "neutral", "male", "female"):
+            for v in buckets.get(name, []):
+                if v["voice_id"] not in used:
+                    chosen = v
+                    break
+            if chosen:
+                break
+        if not chosen:
+            chosen = next((v for v in pool if v["voice_id"] not in used), pool[0] if pool else None)
+        if chosen:
+            used.add(chosen["voice_id"])
+            result.append({"character_id": c["id"], "voice_id": chosen["voice_id"],
+                           "voice_name": chosen["name"], "updated_at": core.now_iso()})
+    return result
+
+
 async def _ensure_voice(series: dict, ep: dict, character_id: str) -> dict:
-    """Auto-assign a distinct locked voice per character (smart gender casting)."""
-    assignments = list(ep.get("voice_assignments", []))
-    existing = next((v for v in assignments if v["character_id"] == character_id), None)
-    if existing:
-        return existing
+    """Return the character's single locked voice, casting the whole episode
+    deterministically if it has not been cast yet. Idempotent and race-safe:
+    concurrent calls compute the same mapping, so no character can end up with
+    two voices."""
     manifest = ep["manifest"]
-    profile = next((c for c in manifest["characters"] if c["id"] == character_id), None)
-    gender = _infer_gender(profile.get("detailed_visual_profile", "")) if profile else None
-    used = {v["voice_id"] for v in assignments}
-    pool = _voices()
-    candidates = [v for v in pool if v["voice_id"] not in used]
-    if gender:
-        gendered = [v for v in candidates if (v.get("gender") or "").lower() == gender]
-        if gendered:
-            candidates = gendered
-    if not candidates:
-        candidates = [v for v in pool if v["voice_id"] not in used] or pool
-    chosen = candidates[0]
-    assignment = {"character_id": character_id, "voice_id": chosen["voice_id"],
-                  "voice_name": chosen["name"], "updated_at": core.now_iso()}
-    assignments.append(assignment)
+    assignments = _normalize_assignments(ep.get("voice_assignments", []), manifest)
+    found = next((v for v in assignments if v["character_id"] == character_id), None)
+    if not found:
+        try:
+            assignments = _cast_all_voices(series, manifest, assignments)
+        except pipeline.ProviderError:
+            raise
+        found = next((v for v in assignments if v["character_id"] == character_id), None)
     await ep_update(ep["id"], {"voice_assignments": assignments})
     ep["voice_assignments"] = assignments
-    return assignment
+    if not found:
+        raise pipeline.ProviderError("No voice could be cast for this character.")
+    return found
 
 
 @router.post("/projects/{project_id}/episodes/{n}/voices/auto")
@@ -582,23 +642,25 @@ async def auto_assign_voices(project_id: str, n: int, user: core.CurrentUser):
     if not manifest:
         raise HTTPException(status_code=400, detail="Generate the script first")
     try:
-        for c in manifest["characters"]:
-            await _ensure_voice(series, ep, c["id"])
+        assignments = _cast_all_voices(series, manifest,
+                                       _normalize_assignments(ep.get("voice_assignments", []), manifest))
     except pipeline.ProviderError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    ep = await core.db.episodes.find_one({"id": ep["id"]}, {"_id": 0})
+    ep = await ep_update(ep["id"], {"voice_assignments": assignments})
     return serialize_episode(series, ep)
 
 
 @router.post("/projects/{project_id}/episodes/{n}/characters/{cid}/voice")
 async def set_voice(project_id: str, n: int, cid: str, body: VoiceBody, user: core.CurrentUser):
     series, ep = await _load_pipeline_episode(project_id, n, user)
+    manifest = ep.get("manifest")
     name = body.voice_name or next((v["name"] for v in _voices() if v["voice_id"] == body.voice_id), body.voice_id)
-    assignments = [v for v in ep.get("voice_assignments", []) if v["character_id"] != cid]
+    assignments = [v for v in _normalize_assignments(ep.get("voice_assignments", []), manifest)
+                   if v["character_id"] != cid]
     assignments.append({"character_id": cid, "voice_id": body.voice_id, "voice_name": name,
                         "updated_at": core.now_iso()})
     ep = await ep_update(ep["id"], {"voice_assignments": assignments})
-    # Re-synthesizing existing lines uses the new voice on next generation.
+    # Existing dialogue takes are re-synthesized with the new voice on next (re-)render.
     return serialize_episode(series, ep)
 
 

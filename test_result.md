@@ -109,3 +109,39 @@ snatching for the file"). Retry resubmitted the same flagged prompt, so it faile
 - Do NOT render any other lines/scenes.
 
 
+
+---
+## Iteration 5 — Fix: same character got different voices across scenes (voice locking)
+
+### Root cause
+Voice assignment was a non-deterministic read-modify-write on `voice_assignments`:
+- `_ensure_voice` picked "first available voice" from a possibly-stale snapshot, so concurrent
+  requests (auto-assign racing with shot generation) caused lost updates / duplicate records.
+- `_ensure_voice` resolved a character to the FIRST matching record while `serialize` used the LAST,
+  so duplicates diverged. A character's locked voice could therefore change between scenes, and any
+  clip already rendered kept the older voice -> "same character, two voices."
+- Additionally the user's episode still had ONE legacy clip (scene-1-line-2, `stage=None`) rendered by
+  the pre-close-up code (lip-synced the multi-character master -> wrong face).
+
+### Fixes (backend, zero credits)
+1. `_cast_all_voices` — DETERMINISTIC casting: one distinct gender-appropriate voice per character,
+   stable for a given series seed + character set, independent of call order/concurrency. Voices are
+   locked up-front at `gen_script` (single request -> no race). Idempotent.
+2. `_normalize_assignments` — dedupes to ONE voice per character (latest updated_at wins) and drops
+   assignments for characters not in the manifest; used in serialize, _ensure_voice, set_voice, auto.
+3. Audio is re-synthesized on the next (re-)render when a line's take voice != the locked voice
+   (already added in iter3) so all lines converge to the locked voice.
+4. DATA REPAIR (no credits): removed the stale legacy `stage=None` clip from the user's episode
+   (project c69332993aec4f1fbbae370a70726c09) and any voice-mismatched takes, keeping correct audio so
+   re-generating those lines costs no voice credits.
+
+### Verify — STRICT: DO NOT SPEND ANY CREDITS
+- Run pytest `/app/backend/tests/test_iter5_voice_lock.py` (monkeypatched pool; asserts deterministic,
+  distinct, gender-appropriate, order/race-independent casting + dedupe-latest-wins). Zero external cost.
+- API (free, NO generation): GET /api/voices; POST /api/projects/c69332993aec4f1fbbae370a70726c09/
+  episodes/1/voices/auto then GET the episode and assert EACH character has exactly one voice and it is
+  unchanged (A/Lena->gIc8QsaPK81pJ73KJ6Oc, B->CwhRBWXzGAHq8TQ4Fs17, C->IKne3meq5aSn9XLyUdCD); calling
+  /voices/auto again returns the SAME mapping (idempotent).
+- ABSOLUTELY FORBIDDEN (would spend the user's credits): generating synopsis/script (LLM), character or
+  scene images, motion clips, dialogue shots, or any ElevenLabs voice synthesis. Do NOT create new
+  series requiring script generation. Reuse the existing project only.

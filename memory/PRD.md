@@ -67,6 +67,19 @@ Lip-sync (PixVerse, per dialogue line against the scene's master motion clip) �
 - **Bug fixed**: frontend was calling old Phase 1 routes -> `Unexpected token '<' ... <!DOCTYPE`
   on character generation. Fixed by the full Phase 2 rewire + graceful non-JSON error in `request()`.
 
+## Fix (2026-09-18d) — Same character had different voices across scenes (voice locking)
+- **Symptom:** one character (e.g. "Lena") spoke in different voices in different scenes.
+- **Root cause:** voice assignment was a non-deterministic read-modify-write; concurrent auto-assign +
+  shot generation caused lost updates / duplicate records, and `_ensure_voice` (first match) vs
+  `serialize` (last match) diverged, so a character's locked voice could change between scenes (already
+  rendered clips kept the older voice). One legacy `stage=None` clip (pre close-up) also lingered.
+- **Fixes (zero credits):** `_cast_all_voices` = deterministic, race-safe, gender-aware casting (one
+  distinct voice per character, stable per series seed, locked up-front at script generation);
+  `_normalize_assignments` dedupes to one-voice-per-character (latest wins) everywhere; audio is
+  re-synthesized on the next render when a take's voice != the locked voice. Data-repaired the user's
+  episode (removed the stale legacy clip, kept correct audio) with no model calls. Verified 10/10
+  (4 unit + 6 live-API) using only free voice metadata + DB — no paid generation.
+
 ## Fix (2026-09-18c) — Dialogue shots blocked by content moderation; Retry now works
 - **Symptom:** dialogue "voicing" shots FAILED with "The render could not finish." and Retry never
   recovered. **Root cause:** Luma Ray 3.2 content-moderation rejected the per-line close-up prompt at

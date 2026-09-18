@@ -1,0 +1,39 @@
+{
+  "summary": "Iter5 per-character voice-locking fix verified end-to-end with ZERO paid credits spent (no LLM, no image gen, no Replicate/Luma/PixVerse renders, no ElevenLabs TTS calls). 10/10 tests pass: (a) 4 unit tests in test_iter5_voice_lock.py — _cast_all_voices is deterministic, produces 3 distinct gender-appropriate voices, is order/concurrency independent (partial existing mapping is preserved), _normalize_assignments dedupes to one voice per character with latest-updated_at wins and drops non-manifest characters (GHOST). (b) 6 API tests in test_iter5_voice_api.py against the live public backend for existing project c69332993aec4f1fbbae370a70726c09: GET /api/voices returns a non-empty pool; POST /voices/auto locks CHARACTER_A(Lena)->gIc8QsaPK81pJ73KJ6Oc, CHARACTER_B->CwhRBWXzGAHq8TQ4Fs17, CHARACTER_C->IKne3meq5aSn9XLyUdCD; second call to /voices/auto is idempotent (identical mapping); GET episode confirms no character resolves to two different voices across characters[] or scene dialogue lines, and every dialogue line's character_id still points to its locked voice; the data repair is confirmed — scene-1 line 'scene-1-line-2' (Lena/CHARACTER_A) now has shot == null so it can be regenerated cleanly, while all other scene lines retain their locked voice mapping.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iter5_voice_lock.py",
+    "/app/backend/tests/test_iter5_voice_api.py",
+    "/app/test_reports/pytest/iter5_results.xml",
+    "/app/test_reports/pytest/iter5_api_results.xml",
+    "/app/test_reports/pytest/iter5_combined.xml"
+  ],
+  "action_items": [
+    "None — the voice-locking fix is verified and no code changes are required. The mapping A/B/C -> gIc8QsaPK81pJ73KJ6Oc / CwhRBWXzGAHq8TQ4Fs17 / IKne3meq5aSn9XLyUdCD is locked, idempotent, and consistent across characters[] and every dialogue line in every scene of the serialized episode.",
+    "Optional (non-blocking, carried over from iter3/iter4): orphaned close-up/lip-sync/audio storage paths in Emergent Object Storage still accumulate on re-render. Not part of this fix."
+  ],
+  "critical_code_review_comments": [
+    "routes._cast_all_voices (routes.py:577-614) is correctly seeded from series.seed and sorts pool + manifest characters by id before shuffling per gender bucket — this makes assignment deterministic and order-independent. `existing` entries are preserved via the `locked` set, so partial pre-locks cannot be overwritten by a concurrent recompute (race-safe).",
+    "routes._normalize_assignments (routes.py:558-574) dedupes to one voice per character using string comparison of updated_at (ISO-8601). Because ISO-8601 lex order == chronological order, latest-wins is correct. Non-manifest characters are dropped so ghost/legacy records cannot resurface in the serialized episode.",
+    "routes._ensure_voice (routes.py:617-635) casts the whole episode's voices deterministically when a requested character is missing, then persists via ep_update — so per-scene shot rendering can never derive a different voice for the same character than what was locked at script-generation time.",
+    "routes.serialize_episode (routes.py:161) applies _normalize_assignments on read as an additional safety net — even if a stale duplicate somehow persisted, the serialized characters[] and voice lookup will still be one-per-character."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iter5_voice_api.py (created — 6 zero-cost live-API tests exercising GET /voices, POST /voices/auto x2 for idempotency, GET episode for cross-character/cross-line divergence check, and confirmation of the stale-shot repair on scene-1-line-2)"
+  ],
+  "success_rate": {"backend": "100% (10/10 tests: 4 unit + 6 live-API, zero credits)", "frontend": "not tested (backend-only per spec)"},
+  "seed_data_creation": "None. Reused existing project c69332993aec4f1fbbae370a70726c09 (owner user 05eaa4c4d69f4297b9a416b39689f0f1, homdahal4180@gmail.com). JWT minted in-process via core.make_access_token(OWNER_ID) exactly as prior iterations. No new documents created; /voices/auto only rewrites the episode's voice_assignments array to the same idempotent locked mapping.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Iter5 voice-lock verification suite lives at /app/backend/tests/test_iter5_voice_api.py (live-API) and /app/backend/tests/test_iter5_voice_lock.py (unit). Both are zero-cost and idempotent — safe to rerun any time. Run: `python -m pytest /app/backend/tests/test_iter5_voice_lock.py /app/backend/tests/test_iter5_voice_api.py -v`. Auth uses core.make_access_token(OWNER_ID) with OWNER_ID='05eaa4c4d69f4297b9a416b39689f0f1'. If ownership of project c69332993aec4f1fbbae370a70726c09 is ever transferred, update OWNER_ID at the top of test_iter5_voice_api.py. The locked mapping constants are: A=gIc8QsaPK81pJ73KJ6Oc, B=CwhRBWXzGAHq8TQ4Fs17, C=IKne3meq5aSn9XLyUdCD — if the ElevenLabs voice pool changes, these will need to be recomputed via _cast_all_voices with the new pool.",
+  "rca_of_issue": "REPORTED BUG — 'the same character, Lena, generates two different voices for different scenes'. RCA: (1) voice assignment was previously a non-deterministic read-modify-write — when two shot-renders raced (e.g. user tapping render on two lines at once), each read the current voice_assignments, computed a potentially different mapping (random.choice without a stable seed / order), and wrote back — the last writer's mapping won for the whole episode, so a character already spoken by one voice could be reassigned mid-episode. (2) _ensure_voice resolved a character via `first-match` while serialize_episode resolved via a `last-match` map, so if duplicate assignments existed the two code paths could return different voices — one used at render time, another shown in the UI. FIX (already applied by main agent in routes.py): (a) _cast_all_voices — deterministic seeded RNG (Random(series.seed)) + sorted pool + sorted manifest characters + gender buckets, preserves any existing lock, so recomputation under concurrency yields identical output; race-safe (idempotent). (b) _normalize_assignments — dedupes to one voice per character with latest-updated_at wins, drops non-manifest characters; applied on both write (voices/auto, set_voice, _ensure_voice) and read (serialize_episode) paths so no divergence is possible. (c) voices are cast up-front at script generation (routes.py:391), preventing lazy divergent creation later. Free data-repair removed a stale legacy lipsync clip on scene-1-line-2 (Lena) so it can be regenerated cleanly with the correct locked voice. VERIFICATION: the 10-test suite proves determinism, idempotency, gender-appropriateness, race/order independence, dedup-with-latest-wins, non-manifest drop, exact-expected mapping across the live episode, no cross-line divergence, and the stale-shot removal. MITIGATION: none required — the code fix is complete and verified end-to-end."
+}
