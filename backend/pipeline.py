@@ -374,6 +374,35 @@ def start_luma_motion(prompt: str, start_image_url: str) -> dict:
     return replicate_start(LUMA_MODEL, {"prompt": prompt, "start_image": start_image_url, "duration": 5})
 
 
+def build_dialogue_closeup_prompt(global_style: str, scene: dict, character: dict,
+                                  line_text: str, orientation: str) -> str:
+    """Per-line speaking close-up of a SINGLE character (faithful to reference
+    buildDialogueCloseupPrompt). This guarantees only the speaking character is
+    in frame so the lip-sync animates the correct face."""
+    hint = "vertical 9:16" if orientation == "vertical" else "horizontal 16:9"
+    parts = [
+        f"Create one continuous five-second {hint} cinematic drama speaking close-up from the supplied first frame.",
+        "Use the saved character reference as the exact first frame and preserve the subject's identity, "
+        "face, hair, wardrobe, lighting, and color grade.",
+        f"Frame {character['id']} in a tight medium or head-and-shoulders shot with a frontal or near-frontal "
+        "face, readable eyes, and an unobstructed mouth.",
+        "Use steady restrained head movement and minimal camera motion. Keep the performance intimate and controlled.",
+        "Make this one continuous take with no cutaways, transitions, scene changes, extra people, subtitles, "
+        "logos, or text overlays.",
+        "The mouth movement is visual performance guidance only. Do not generate audio and do not embed a voice or soundtrack.",
+        f"Global visual style: {global_style}" if global_style else "",
+        f"Saved character profile: {character.get('detailed_visual_profile', '')}" if character.get("detailed_visual_profile") else "",
+        f"Saved scene direction: {scene.get('visual_prompt', '')}" if scene.get("visual_prompt") else "",
+        f"Saved camera context: {scene.get('camera_movement', '')}" if scene.get("camera_movement") else "",
+        f'Exact saved dialogue text for timing guidance only: "{line_text}"',
+    ]
+    return "\n".join(p for p in parts if p)
+
+
+def start_luma_closeup(prompt: str, start_image_url: str) -> dict:
+    return replicate_start(LUMA_MODEL, {"prompt": prompt, "start_image": start_image_url, "duration": 5})
+
+
 def start_pixverse_lipsync(video_url: str, audio_url: str) -> dict:
     return replicate_start(PIXVERSE_MODEL, {"video": video_url, "audio": audio_url})
 

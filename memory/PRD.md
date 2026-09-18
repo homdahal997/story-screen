@@ -67,6 +67,19 @@ Lip-sync (PixVerse, per dialogue line against the scene's master motion clip) �
 - **Bug fixed**: frontend was calling old Phase 1 routes -> `Unexpected token '<' ... <!DOCTYPE`
   on character generation. Fixed by the full Phase 2 rewire + graceful non-JSON error in `request()`.
 
+## Fix (2026-09-18b) — Correct-character lip-sync + working re-render
+- **Wrong character lip-syncing** fixed: lip-sync was applied to the multi-character scene master, so
+  PixVerse animated the wrong face. Now, faithful to buildy, each dialogue line renders a
+  single-character **speaking close-up** (Luma) from the SPEAKING character's own reference image, and
+  the lip-sync is applied to that close-up. Two-stage per line: CLOSEUP (Luma) → LIPSYNC (PixVerse),
+  orchestrated inside the poll endpoint. Episode doc gained `closeup_clips`.
+- **Re-render** fixed for both dialogue shots and scene motion: they no longer short-circuit when
+  already READY (only skip while a render is in-flight).
+- **Voice change** now applies on re-render: line audio is re-synthesized when the character's current
+  locked voice (or line text) differs from the stored take.
+- Verified backend-only, cost-controlled (1 close-up+lip-sync to READY, 1 re-render start, 1 motion
+  re-render start): 6/6 regression tests pass (`backend/tests/test_iter3_bugfixes.py`).
+
 ## Backlog / Next (Phase 2 follow-up)
 - Server-side stitching of an episode's shots into one downloadable/playable video with audio.
 

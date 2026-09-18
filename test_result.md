@@ -48,4 +48,33 @@
   Next-button gating → series detail episode locks.
 
 ---
-(Testing agent appends structured results to /app/test_reports/iteration_{n}.json)
+## Iteration 3 — Fix: wrong-character lip-sync + broken re-render (verify)
+
+### Root causes & fixes
+1. **Wrong character was lip-syncing.** Previously the PixVerse lip-sync was applied to the SCENE
+   MASTER motion clip, which can contain multiple characters, so the wrong face was animated.
+   FIX (faithful to buildy reference `buildDialogueCloseupPrompt`): each dialogue line now first
+   renders a **single-character speaking close-up** (Luma) built from the SPEAKING character's own
+   reference image, and the lip-sync is applied to THAT close-up. So only the correct character is
+   ever in frame. New two-stage flow per line: CLOSEUP (Luma) -> LIPSYNC (PixVerse).
+   - `pipeline.build_dialogue_closeup_prompt(...)` + `pipeline.start_luma_closeup(...)`.
+   - Episode doc gained a `closeup_clips` list; `routes.start_dialogue_shot` starts the close-up from
+     the speaking character's `character_reference`; `routes.poll_dialogue_shot` polls the close-up,
+     archives it, then starts + polls the PixVerse lip-sync of the close-up.
+2. **"Re-render" did nothing.** `start_dialogue_shot` and `start_motion` short-circuited and returned
+   early when status was already READY. FIX: they now only short-circuit while a render is in-flight
+   (QUEUED/PROCESSING); a READY/FAILED item can be re-rendered.
+3. **Voice change didn't take effect on re-render.** Audio was only synthesized once. FIX:
+   `start_dialogue_shot` re-synthesizes the line audio whenever the character's current locked voice
+   (or the line text) differs from the stored take, so a changed voice is applied on re-render.
+
+### Verify (STRICT COST CONTROL — user asked not to spend credits)
+- Backend only. Reuse an existing series/episode that already has script + character images.
+- Confirm `start_dialogue_shot` for ONE line: returns QUEUED, creates a `closeup_clips` record whose
+  source is the SPEAKING character (character_id matches the line), and a `lipsync_clips` record with
+  stage=CLOSEUP. Poll drives CLOSEUP -> (PixVerse) LIPSYNC -> READY for that ONE line only.
+- Confirm re-render: calling start on that line again AFTER it is READY starts a NEW render (status
+  QUEUED again) rather than returning the old READY.
+- Confirm re-render on a READY master motion scene also starts a new render (no READY short-circuit).
+- Do NOT render more than ONE dialogue line and at most ONE extra motion re-render. No frontend E2E renders.
+

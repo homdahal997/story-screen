@@ -419,7 +419,7 @@ export default function Pipeline() {
                 <Text style={{ color: colors.fog, fontSize: 13 }}>No dialogue shots needed for this episode.</Text>
               ) : (
                 <>
-                  <Text style={{ color: colors.fog, fontSize: 12, marginBottom: spacing.md }}>Each spoken line synthesizes its voice and lip-syncs the scene clip. This runs on demand.</Text>
+                  <Text style={{ color: colors.fog, fontSize: 12, marginBottom: spacing.md }}>Each spoken line renders a close-up of the speaking character in their locked voice, then lip-syncs it. This runs on demand.</Text>
                   {ep.scenes.map((s) => (
                     s.lines.length === 0 ? null : (
                       <View key={s.scene_number} style={{ marginBottom: spacing.lg }}>
@@ -430,35 +430,35 @@ export default function Pipeline() {
                           const rendering = status === 'QUEUED' || status === 'PROCESSING';
                           const k = `shot-${s.scene_number}-${line.line_id}`;
                           const char = ep.characters.find((c) => c.id === line.character_id);
-                          const masterReady = s.master?.status === 'READY';
+                          const charReady = !!char?.image_url;
                           return (
                             <View key={line.line_id} style={{ backgroundColor: colors.graphite, borderRadius: 8, padding: spacing.md, marginBottom: spacing.sm }}>
                               <Text style={{ color: colors.bone, fontSize: 12, fontWeight: '600' }}>{char?.name || line.character_id}</Text>
                               <Text style={{ color: colors.fog, fontSize: 13, marginTop: 2, fontStyle: 'italic' }}>“{line.text}”</Text>
                               <View style={{ aspectRatio: ratio, borderRadius: 8, overflow: 'hidden', backgroundColor: colors.ink, justifyContent: 'center', alignItems: 'center', maxHeight: 300, marginTop: spacing.sm }}>
                                 {status === 'READY' && shot?.video_url ? <SceneClipPlayer uri={shot.video_url} />
-                                  : s.storyboard_url ? <Image source={{ uri: s.storyboard_url }} style={{ width: '100%', height: '100%' }} contentFit="cover" />
+                                  : char?.image_url ? <Image source={{ uri: char.image_url }} style={{ width: '100%', height: '100%' }} contentFit="cover" />
                                     : <Text style={{ color: colors.fog }}>Shot</Text>}
                                 {rendering && (
                                   <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.55)', justifyContent: 'center', alignItems: 'center' }}>
                                     <ActivityIndicator color={colors.bone} />
-                                    <Text style={{ color: colors.bone, fontSize: 12, marginTop: spacing.sm }}>Lip-syncing…</Text>
+                                    <Text style={{ color: colors.bone, fontSize: 12, marginTop: spacing.sm }}>Rendering shot…</Text>
                                   </View>
                                 )}
                               </View>
                               {!rendering && (
                                 <Pressable
                                   testID={`generate-shot-${s.scene_number}-${line.line_id}`}
-                                  disabled={!masterReady || working === k}
+                                  disabled={!charReady || working === k}
                                   onPress={() => runItem(k, () => api.startShot(projectId, n, s.scene_number, line.line_id))}
-                                  style={{ marginTop: spacing.sm, alignSelf: 'flex-start', backgroundColor: masterReady ? PURPLE : `${colors.fog}44`, paddingHorizontal: spacing.md, paddingVertical: spacing.xs, borderRadius: 14 }}
+                                  style={{ marginTop: spacing.sm, alignSelf: 'flex-start', backgroundColor: charReady ? PURPLE : `${colors.fog}44`, paddingHorizontal: spacing.md, paddingVertical: spacing.xs, borderRadius: 14 }}
                                 >
                                   <Text style={{ color: colors.bone, fontSize: 12, fontWeight: '600' }}>
                                     {working === k ? '…' : status === 'READY' ? 'Re-render' : status === 'FAILED' ? 'Retry' : 'Generate shot'}
                                   </Text>
                                 </Pressable>
                               )}
-                              {!masterReady && <Text style={{ color: colors.fog, fontSize: 11, marginTop: spacing.xs }}>Generate this scene&apos;s motion clip first.</Text>}
+                              {!charReady && <Text style={{ color: colors.fog, fontSize: 11, marginTop: spacing.xs }}>Generate this character&apos;s image first.</Text>}
                               {shot?.error ? <Text style={{ color: colors.signal, fontSize: 11, marginTop: spacing.xs }}>{shot.error}</Text> : null}
                             </View>
                           );

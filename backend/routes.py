@@ -73,7 +73,7 @@ async def get_episode_doc(project_id: str, n: int, user: dict, create: bool = Fa
         "id": core.new_id(), "project_id": project_id, "owner_id": user["id"],
         "episode_number": n, "status": "DRAFT", "synopsis": "", "manifest": None,
         "frame_assets": [], "video_clips": [], "voice_assignments": [],
-        "audio_assets": [], "lipsync_clips": [],
+        "audio_assets": [], "closeup_clips": [], "lipsync_clips": [],
         "created_at": core.now_iso(), "updated_at": core.now_iso(),
     }
     await core.db.episodes.insert_one(ep)
@@ -111,6 +111,11 @@ def _line_audio(ep: dict, scene_number: int, line_id: str):
 
 def _line_shot(ep: dict, scene_number: int, line_id: str):
     return next((c for c in ep.get("lipsync_clips", [])
+                 if c["scene_number"] == scene_number and c["line_id"] == line_id), None)
+
+
+def _line_closeup(ep: dict, scene_number: int, line_id: str):
+    return next((c for c in ep.get("closeup_clips", [])
                  if c["scene_number"] == scene_number and c["line_id"] == line_id), None)
 
 
@@ -458,7 +463,7 @@ async def start_motion(project_id: str, n: int, s: int, user: core.CurrentUser):
         raise HTTPException(status_code=400, detail="Generate this scene's storyboard first")
     clips = list(ep.get("video_clips", []))
     existing = _master_clip(ep, s)
-    if existing and existing.get("status") in ("QUEUED", "PROCESSING", "READY"):
+    if existing and existing.get("status") in ("QUEUED", "PROCESSING"):
         return {"scene_number": s, "status": existing["status"], "prediction_id": existing.get("prediction_id")}
     prompt = pipeline.build_master_motion_prompt(manifest["global_style"], scene, series["orientation"])
     try:
@@ -617,48 +622,78 @@ async def start_dialogue_shot(project_id: str, n: int, s: int, line_id: str, use
     scene, line = _find_line(manifest, s, line_id)
     if not line:
         raise HTTPException(status_code=404, detail="Dialogue line not found")
-    master = _master_clip(ep, s)
-    if not master or master.get("status") != "READY" or not master.get("storage_path"):
-        raise HTTPException(status_code=400, detail="Generate this scene's motion clip first")
+    character = next((c for c in manifest["characters"] if c["id"] == line["character_id"]), None)
+    if not character:
+        raise HTTPException(status_code=404, detail="Speaking character not found")
+    # The close-up source frame is the SPEAKING character's reference image so that
+    # only that one character is in frame and the lip-sync animates the correct face.
+    ref = _asset(ep, "character_reference", character_id=line["character_id"])
+    if not ref:
+        raise HTTPException(status_code=400, detail="Generate this character's image first")
 
     existing = _line_shot(ep, s, line_id)
-    if existing and existing.get("status") in ("QUEUED", "PROCESSING", "READY"):
+    if existing and existing.get("status") in ("QUEUED", "PROCESSING"):
         return {"scene_number": s, "line_id": line_id, "status": existing["status"],
                 "prediction_id": existing.get("prediction_id")}
 
-    # 1) Ensure the line's voice take (locked per-character voice) exists.
+    # 1) Ensure the line audio matches the character's CURRENT locked voice (and text).
+    try:
+        assignment = await _ensure_voice(series, ep, line["character_id"])
+    except pipeline.ProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     audio = _line_audio(ep, s, line_id)
-    if not audio:
+    if (not audio) or audio.get("voice_id") != assignment["voice_id"] or audio.get("text") != line["text"]:
         try:
-            assignment = await _ensure_voice(series, ep, line["character_id"])
             mp3 = pipeline.synthesize_voice(assignment["voice_id"], line["text"])
             apath = await core.store_bytes(user["id"], mp3, "mp3", "audio/mpeg")
         except pipeline.ProviderError as e:
             raise HTTPException(status_code=502, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Voice synthesis failed: {e}")
-        audio_assets = list(ep.get("audio_assets", []))
         audio = {"scene_number": s, "line_id": line_id, "character_id": line["character_id"],
                  "voice_id": assignment["voice_id"], "voice_name": assignment["voice_name"],
                  "text": line["text"], "storage_path": apath, "created_at": core.now_iso()}
-        audio_assets = [a for a in audio_assets if not (a["scene_number"] == s and a["line_id"] == line_id)]
+        audio_assets = [a for a in ep.get("audio_assets", []) if not (a["scene_number"] == s and a["line_id"] == line_id)]
         audio_assets.append(audio)
         ep = await ep_update(ep["id"], {"audio_assets": audio_assets})
 
-    # 2) Start PixVerse lip-sync of the master clip against the line audio.
+    # 2) Start the per-line speaking CLOSE-UP (single character) via Luma.
+    prompt = pipeline.build_dialogue_closeup_prompt(
+        manifest["global_style"], scene, character, line["text"], series["orientation"])
     try:
-        started = pipeline.start_pixverse_lipsync(
-            core.media_url(master["storage_path"]), core.media_url(audio["storage_path"]))
+        started = pipeline.start_luma_closeup(prompt, core.media_url(ref["storage_path"]))
     except pipeline.ProviderError as e:
         raise HTTPException(status_code=502, detail=str(e))
+    closeups = [c for c in ep.get("closeup_clips", []) if not (c["scene_number"] == s and c["line_id"] == line_id)]
+    closeups.append({"scene_number": s, "line_id": line_id, "character_id": line["character_id"],
+                     "prediction_id": started["prediction_id"], "status": started["status"],
+                     "storage_path": None, "error": None,
+                     "created_at": core.now_iso(), "updated_at": core.now_iso()})
+    # 3) Reset the dialogue shot record to the CLOSEUP stage (lip-sync starts once the close-up is ready).
     shots = [c for c in ep.get("lipsync_clips", []) if not (c["scene_number"] == s and c["line_id"] == line_id)]
     shots.append({"scene_number": s, "line_id": line_id, "character_id": line["character_id"],
-                  "prediction_id": started["prediction_id"], "status": started["status"],
+                  "stage": "CLOSEUP", "prediction_id": None, "status": started["status"],
                   "storage_path": None, "error": None,
                   "created_at": core.now_iso(), "updated_at": core.now_iso()})
-    await ep_update(ep["id"], {"lipsync_clips": shots})
+    await ep_update(ep["id"], {"closeup_clips": closeups, "lipsync_clips": shots})
     return {"scene_number": s, "line_id": line_id, "status": started["status"],
             "prediction_id": started["prediction_id"]}
+
+
+def _save_closeup(ep: dict, s: int, line_id: str, changes: dict):
+    clips = list(ep.get("closeup_clips", []))
+    for c in clips:
+        if c["scene_number"] == s and c["line_id"] == line_id:
+            c.update(changes)
+    return clips
+
+
+def _save_shot(ep: dict, s: int, line_id: str, changes: dict):
+    shots = list(ep.get("lipsync_clips", []))
+    for c in shots:
+        if c["scene_number"] == s and c["line_id"] == line_id:
+            c.update(changes)
+    return shots
 
 
 @router.get("/projects/{project_id}/episodes/{n}/scenes/{s}/lines/{line_id}/shot")
@@ -670,6 +705,59 @@ async def poll_dialogue_shot(project_id: str, n: int, s: int, line_id: str, user
     if shot.get("status") == "READY" and shot.get("storage_path"):
         return {"scene_number": s, "line_id": line_id, "status": "READY",
                 "video_url": core.media_url(shot["storage_path"])}
+
+    stage = shot.get("stage", "LIPSYNC")
+
+    # Stage 1: render the speaking close-up, then kick off the lip-sync.
+    if stage == "CLOSEUP":
+        closeup = _line_closeup(ep, s, line_id)
+        if not closeup:
+            raise HTTPException(status_code=404, detail="No close-up render for this line")
+        if not (closeup.get("status") == "READY" and closeup.get("storage_path")):
+            try:
+                result = pipeline.replicate_poll(closeup["prediction_id"])
+            except pipeline.ProviderError as e:
+                raise HTTPException(status_code=502, detail=str(e))
+            cu_changes = {"status": result["status"], "updated_at": core.now_iso()}
+            if result["status"] == "SUCCEEDED" and result.get("output_url"):
+                try:
+                    data = pipeline.download_replicate_file(result["output_url"])
+                    cpath = await core.store_bytes(user["id"], data, "mp4", "video/mp4")
+                    cu_changes["status"] = "READY"
+                    cu_changes["storage_path"] = cpath
+                except Exception as e:
+                    cu_changes["status"] = "FAILED"
+                    cu_changes["error"] = f"Archiving failed: {e}"
+            elif result["status"] in ("FAILED", "CANCELED"):
+                cu_changes["error"] = result.get("error")
+            await ep_update(ep["id"], {"closeup_clips": _save_closeup(ep, s, line_id, cu_changes)})
+            ep = await core.db.episodes.find_one({"id": ep["id"]}, {"_id": 0})
+            closeup = _line_closeup(ep, s, line_id)
+            if closeup.get("status") in ("FAILED", "CANCELED"):
+                err = closeup.get("error") or "The close-up render could not finish. You can retry this shot."
+                await ep_update(ep["id"], {"lipsync_clips": _save_shot(
+                    ep, s, line_id, {"status": "FAILED", "error": err, "updated_at": core.now_iso()})})
+                return {"scene_number": s, "line_id": line_id, "status": "FAILED", "error": err}
+        if not (closeup.get("status") == "READY" and closeup.get("storage_path")):
+            return {"scene_number": s, "line_id": line_id, "status": "PROCESSING"}
+
+        # Close-up is ready — start the PixVerse lip-sync of the close-up against the line audio.
+        audio = _line_audio(ep, s, line_id)
+        if not audio:
+            raise HTTPException(status_code=400, detail="Voice take missing for this line")
+        try:
+            started = pipeline.start_pixverse_lipsync(
+                core.media_url(closeup["storage_path"]), core.media_url(audio["storage_path"]))
+        except pipeline.ProviderError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        await ep_update(ep["id"], {"lipsync_clips": _save_shot(ep, s, line_id, {
+            "stage": "LIPSYNC", "prediction_id": started["prediction_id"],
+            "status": started["status"] or "PROCESSING", "updated_at": core.now_iso()})})
+        return {"scene_number": s, "line_id": line_id, "status": "PROCESSING"}
+
+    # Stage 2: poll the lip-sync render and archive when ready.
+    if not shot.get("prediction_id"):
+        return {"scene_number": s, "line_id": line_id, "status": "PROCESSING"}
     try:
         result = pipeline.replicate_poll(shot["prediction_id"])
     except pipeline.ProviderError as e:
@@ -688,11 +776,7 @@ async def poll_dialogue_shot(project_id: str, n: int, s: int, line_id: str, user
             changes["error"] = f"Archiving failed: {e}"
     elif result["status"] in ("FAILED", "CANCELED"):
         changes["error"] = result.get("error")
-    shots = list(ep.get("lipsync_clips", []))
-    for c in shots:
-        if c["scene_number"] == s and c["line_id"] == line_id:
-            c.update(changes)
-    await ep_update(ep["id"], {"lipsync_clips": shots})
+    await ep_update(ep["id"], {"lipsync_clips": _save_shot(ep, s, line_id, changes)})
     out = {"scene_number": s, "line_id": line_id, "status": changes["status"]}
     if video_url:
         out["video_url"] = video_url
