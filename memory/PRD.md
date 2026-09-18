@@ -48,6 +48,29 @@ FastAPI backend and wires the existing Expo screens to it.
   single stitched exportable episode with audio; advanced multi-shot planning.
 - **P2**: Real forgot-password flow (currently visual only).
 
+## Phase 2 (2026-09-18) — Series → Episodes + Voice + Lip-sync
+Reworked from single "project + scenes" into **Series → Episodes**. Each series has a premise,
+orientation, art style and a total episode count. Episode 1 is unlocked; Episodes 2+ stay locked
+until Episode 1 is fully generated (guarded server-side, 403). Every episode runs the full reference
+pipeline on demand (per-stage buttons, to control credit spend):
+Synopsis → Script → Character images → Storyboards → Motion (Luma Ray 3.2) →
+Voice (ElevenLabs, a distinct locked voice auto-cast per speaking character, changeable) →
+Lip-sync (PixVerse, per dialogue line against the scene's master motion clip) → Preview.
+
+- **Backend** (`core.py`, `pipeline.py`, `routes.py`): `projects` collection stores series;
+  `episodes` collection stores per-episode manifest, frame_assets, video_clips, voice_assignments,
+  audio_assets, lipsync_clips. Voices auto-assigned with smart gender casting from the character
+  profile. ElevenLabs `eleven_multilingual_v2`; PixVerse + Luma via Replicate predictions API.
+- **Frontend**: `api.ts` (Series/Episode types + episode endpoints, hardened non-JSON handling),
+  `CreateWorkSheet` (Total Episodes 10/45/60/Custom), `mylist` (series list), `project/[id]`
+  (series detail + episode locks), `create/pipeline` (8-step per-episode stepper wizard, on-demand).
+- **Bug fixed**: frontend was calling old Phase 1 routes -> `Unexpected token '<' ... <!DOCTYPE`
+  on character generation. Fixed by the full Phase 2 rewire + graceful non-JSON error in `request()`.
+
+## Backlog / Next (Phase 2 follow-up)
+- Server-side stitching of an episode's shots into one downloadable/playable video with audio.
+
 ## Notes
-- Video is slow (~1-2 min/scene) and consumes Replicate credits; clips are archived for reuse.
-- Replicate token + Emergent keys live only in backend/.env.
+- Video (Luma) and lip-sync (PixVerse) are slow (~1-2 min each) and consume Replicate credits;
+  every generated clip is archived to object storage for reuse. Generation is strictly on-demand.
+- Replicate + ElevenLabs + Emergent keys live only in backend/.env.

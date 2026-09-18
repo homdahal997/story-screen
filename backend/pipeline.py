@@ -1,4 +1,10 @@
-"""AI pipeline: synopsis/script text, character & scene images, Luma video."""
+"""AI pipeline faithful to the original reference (/tmp/buildy-reference).
+
+Text (synopsis + screenplay manifest) via Emergent LLM, character & scene images
+via Gemini Nano Banana, motion via Replicate Luma Ray 3.2, voices via ElevenLabs
+(locked per character), lip-sync via Replicate pixverse/lipsync.
+"""
+import asyncio
 import base64
 import json
 import re
@@ -7,211 +13,279 @@ from typing import Optional
 import requests
 from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
 
-from core import EMERGENT_LLM_KEY, REPLICATE_API_TOKEN, new_id
+from core import EMERGENT_LLM_KEY, REPLICATE_API_TOKEN, ELEVENLABS_API_KEY, new_id
 
 TEXT_MODEL = ("openai", "gpt-5.4")
 IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 REPLICATE_BASE = "https://api.replicate.com/v1"
 LUMA_MODEL = "luma/ray-3.2"
+PIXVERSE_MODEL = "pixverse/lipsync"
+
+# Faithful to reference STYLE_PRESETS
+STYLE_PRESETS = {
+    "Live-Action Film": "Cinematic drama, high fidelity, 35mm film texture, photorealistic, moody low-key lighting, 8k framing",
+    "Cinematic Drama": "Cinematic drama, high fidelity, 35mm film texture, photorealistic, moody low-key lighting, 8k framing",
+    "American Illustration Style": "Bold American graphic-novel illustration, inked linework, dramatic cel shading, saturated cinematic color, high detail",
+    "Japanese Anime Style": "High-end Japanese anime, clean linework, expressive eyes, cinematic anime lighting, detailed backgrounds, film-grade color",
+    "Korean Manhwa Style": "Korean manhwa webtoon aesthetic, soft cel shading, romantic glossy rendering, delicate lighting, refined cinematic color",
+    "Corporate Thriller": "High-stakes corporate thriller, sleek modern boardroom, cold blue and warm amber rim lights, hyper-realistic, 8k cinematic framing",
+    "Cyberpunk Noir": "Cyberpunk neo-noir drama, rainy night city reflections, cyan and magenta rim lighting, cinematic lens flare, ultra-photorealistic",
+    "Period Aristocracy": "Period aristocracy drama, grand candlelit ballroom, opulent velvet and gold filigree, soft romantic diffusion with intense dramatic shadows, 8k",
+    "Psychological Suspense": "Psychological suspense thriller, desaturated color grade with sharp red highlights, dramatic chiaroscuro lighting, deep focus cinematic framing",
+}
 
 
-def _orientation_hint(orientation: str) -> str:
-    return "vertical 9:16 portrait composition" if orientation == "vertical" \
-        else "horizontal 16:9 widescreen composition"
+def resolve_global_style(art_style: str) -> str:
+    return STYLE_PRESETS.get(art_style, STYLE_PRESETS["Live-Action Film"])
+
+
+def orientation_label(orientation: str) -> str:
+    return "Horizontal 16:9" if orientation == "horizontal" else "Vertical 9:16"
+
+
+def _frame_direction(orientation: str, style: str = "long") -> str:
+    if orientation == "horizontal":
+        return "landscape-oriented 16:9" if style == "long" else "landscape 16:9"
+    return "portrait-oriented 9:16" if style == "long" else "portrait 9:16"
 
 
 def _extract_json(text: str) -> dict:
     text = text.strip()
-    # strip ```json fences
     fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
     if fence:
         text = fence.group(1).strip()
-    start = text.find("{")
-    end = text.rfind("}")
+    start, end = text.find("{"), text.rfind("}")
     if start != -1 and end != -1:
         text = text[start:end + 1]
     return json.loads(text)
 
 
-async def _chat_json(system: str, prompt: str) -> dict:
-    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=new_id(), system_message=system)
+async def _chat_json(prompt: str) -> dict:
+    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=new_id(),
+                   system_message="You output only strict minified JSON. No prose, no markdown.")
     chat.with_model(*TEXT_MODEL)
     resp = await chat.send_message(UserMessage(text=prompt))
-    text = resp if isinstance(resp, str) else str(resp)
-    return _extract_json(text)
+    return _extract_json(resp if isinstance(resp, str) else str(resp))
 
 
 # ---------------------------------------------------------------------------
-# Synopsis
+# Synopsis (faithful to reference generateStorySetupProposal)
 # ---------------------------------------------------------------------------
-async def generate_synopsis(prompt: str, art_style: str, scene_count: int) -> dict:
+async def generate_synopsis(prompt: str, global_style: str, orientation: str,
+                            scene_count: int, seed: int, story_so_far: str = "") -> dict:
+    bounded = max(3, min(6, round(scene_count or 4)))
+    frame = orientation_label(orientation)
+    context = f"\n\nSerialized context — what happened in earlier episodes:\n{story_so_far}" if story_so_far else ""
+    p = (
+        "You are the setup editor for a premium short-form drama studio. Read the creator's raw "
+        "story idea and prepare only the story setup for review.\n\n"
+        "Return exactly two fields: title and synopsis. Do not write a screenplay, scene list, "
+        "character list, dialogue, shot list, image prompt, or production instructions. The synopsis "
+        "should be detailed enough for a creator to approve the premise before a separate screenplay "
+        "pass, with a clear protagonist, central conflict, emotional stakes, escalation, and a "
+        f"compelling final turn. Keep the synopsis in 2 to 4 readable paragraphs or roughly 160 to 260 "
+        f"words. The project is planned as {bounded} scenes in {frame} framing, using this visual "
+        f"direction: {global_style}. Treat the seed #{seed} as a continuity note only.{context}\n\n"
+        f'Creator\'s raw story idea:\n"""\n{prompt.strip()}\n"""\n\n'
+        'Return ONLY strict JSON: {"title": string (concise dramatic title), '
+        '"synopsis": string}'
+    )
+    data = await _chat_json(p)
+    title = str(data.get("title", "")).strip()[:160]
+    synopsis = str(data.get("synopsis", "")).strip()[:5000]
+    if len(synopsis) < 80:
+        raise RuntimeError("Synopsis was not detailed enough. Please regenerate.")
+    return {"title": title, "synopsis": synopsis}
+
+
+# ---------------------------------------------------------------------------
+# Screenplay manifest (faithful to reference generateDramaScript)
+# ---------------------------------------------------------------------------
+def _clean_id(v: str) -> str:
+    return v.strip().upper().replace(" ", "_")
+
+
+async def generate_script(prompt: str, synopsis: str, global_style: str, orientation: str,
+                          scene_count: int, seed: int, story_so_far: str = "") -> dict:
+    bounded = max(3, min(6, round(scene_count or 4)))
+    frame = orientation_label(orientation)
+    approved = synopsis.strip() if synopsis and synopsis.strip() else \
+        "Expand the creator's premise into a coherent short drama before structuring scenes."
+    context = f"\nSerialized context — earlier episodes:\n{story_so_far}\n" if story_so_far else ""
+
     system = (
-        "You are a master short-drama story editor for a vertical micro-drama studio. "
-        "You craft punchy, emotionally-charged premises with strong hooks and cliffhangers. "
-        "Always respond with strict minified JSON only, no prose, no markdown."
+        "You are an expert AI Screenwriter and Director specializing in viral short dramas (like "
+        "ReelShort, DramaBox, EpNova). You craft a high-stakes, fast-paced, emotionally gripping "
+        "drama scene script from the creator's approved setup.\n\n"
+        "CRITICAL DIRECTIVES:\n"
+        f"1. FORMAT: {frame} framing. Write exact visual camera movements appropriate for that "
+        "composition (for example, a slow face push-in, a low-angle whip pan, or a wide lateral track).\n"
+        "2. CHARACTER CONSISTENCY:\n"
+        '   - Assign characters stable identifiers like "CHARACTER_A", "CHARACTER_B", "CHARACTER_C".\n'
+        "   - For each character, author an ultra-detailed, photorealistic visual profile describing "
+        "exact age, ethnic features, jawline, eye color, hair texture/style/color, signature "
+        "outfit/fabrics, and distinctive marks.\n"
+        "3. SCENES:\n"
+        f"   - Generate EXACTLY {bounded} sequential scenes (numbered 1 through {bounded}).\n"
+        "   - Each scene duration_seconds must be an integer of 3 or 4 seconds.\n"
+        "   - Character dialogue must be brief and punchy. Some scenes may be action/atmosphere with "
+        "no dialogue — for those use an empty dialogue string and an empty dialogue_lines array. For "
+        "dialogue scenes include 1 to 3 speaker-tagged dialogue_lines, each with a stable safe ID such "
+        'as "scene-1-line-1", a character_id from that scene\'s character_focus, short spoken text, '
+        "and sequential order values starting at 1.\n"
+        "   - The dialogue field must contain the dialogue_lines text joined in order with single spaces.\n"
+        "   - Scene visual prompts must explicitly reference character IDs along with precise lighting, "
+        "environment, and physical reaction.\n"
+        "   - Every character in character_focus must match a character ID; every dialogue speaker must "
+        "be in character_focus.\n"
+        "   - Build escalation: Hook in Scene 1, Conflict & Escalation in the middle, a Shocking Twist "
+        "or Cliffhanger in the final scene.\n"
+        f"4. LOCKED SEED REFERENCE: Global project seed is #{seed}."
     )
     user = (
-        f"Create a compelling short-drama episode from this idea:\n\"{prompt}\"\n\n"
-        f"Visual style: {art_style}. The episode has {scene_count} scenes.\n"
-        "Return JSON with exactly these keys:\n"
-        '{"title": string (max 60 chars, catchy), '
-        '"synopsis": string (2-3 vivid paragraphs, ~120-200 words, ending on a hook)}'
+        f'Creator\'s raw premise (creative story narrative only):\n"""\n{prompt}\n"""\n{context}\n'
+        f'Approved story setup synopsis:\n"""\n{approved}\n"""\n\n'
+        f"Target Scene Count: EXACTLY {bounded}\nOutput Orientation: {frame}\n"
+        f"Global Visual Style: {global_style}\n\n"
+        "Return ONLY strict JSON matching this schema:\n"
+        '{"project_title": string, "global_style": string, '
+        '"characters": [{"id": "CHARACTER_A", "detailed_visual_profile": string, "name": string}], '
+        '"scenes": [{"scene_number": int, "character_focus": [id], "visual_prompt": string, '
+        '"camera_movement": string, "dialogue": string, '
+        '"dialogue_lines": [{"line_id": string, "character_id": id, "text": string, "order": int}], '
+        '"duration_seconds": 3 or 4}]}'
     )
-    data = await _chat_json(system, user)
-    return {"title": str(data.get("title", "")).strip()[:70],
-            "synopsis": str(data.get("synopsis", "")).strip()}
+    data = await _chat_json(f"{system}\n\n{user}")
+    return _validate_manifest(data, bounded, global_style)
 
 
-# ---------------------------------------------------------------------------
-# Script / manifest
-# ---------------------------------------------------------------------------
-async def generate_script(prompt: str, title: str, synopsis: str, art_style: str,
-                          orientation: str, scene_count: int) -> dict:
-    system = (
-        "You are a professional screenwriter and cinematographer for AI-generated short "
-        "dramas. You output detailed, production-ready screenplays as strict JSON. "
-        "Character visual profiles must be extremely detailed and consistent so the same "
-        "actor can be re-rendered across scenes. Respond with strict minified JSON only."
-    )
-    user = (
-        f"Title: {title}\nPremise: {prompt}\nSynopsis: {synopsis}\n"
-        f"Visual style: {art_style}. Orientation: {_orientation_hint(orientation)}.\n"
-        f"Write exactly {scene_count} scenes.\n\n"
-        "Return JSON with this exact schema:\n"
-        "{"
-        '"project_title": string, '
-        '"global_style": string (one paragraph describing the consistent cinematic look, '
-        'lighting, color grade, film stock and mood for the whole episode), '
-        '"characters": [ { "id": UPPERCASE_SNAKE_CASE string unique id, "name": string, '
-        '"role": string, "detailed_visual_profile": string (very detailed: age, ethnicity, '
-        'hair, eyes, face shape, build, wardrobe, distinguishing features) } ], '
-        '"scenes": [ { "scene_number": int starting at 1, "heading": string (e.g. '
-        '"INT. CHEN MANSION - NIGHT"), "description": string (what happens), '
-        '"visual_prompt": string (a rich cinematic image prompt for this shot, describing '
-        'framing, subjects, environment, lighting and mood), "camera_movement": string, '
-        '"dialogue": string (a short key line, may be empty), '
-        '"character_focus": [character id strings that appear in this scene] } ]'
-        "}\n"
-        f"Include 2-4 characters. Ensure every scene_focus id exists in characters."
-    )
-    data = await _chat_json(system, user)
-    # sanitize
-    chars = []
-    for c in data.get("characters", [])[:4]:
-        cid = str(c.get("id") or c.get("name", "")).strip().upper().replace(" ", "_")
-        if not cid:
+def _validate_manifest(raw: dict, expected_scenes: int, fallback_style: str) -> dict:
+    title = str(raw.get("project_title", "")).strip() or "Untitled Episode"
+    gstyle = str(raw.get("global_style", "")).strip() or fallback_style
+    chars, ids = [], set()
+    for i, c in enumerate(raw.get("characters", [])[:6]):
+        cid = _clean_id(str(c.get("id") or c.get("name", f"CHARACTER_{chr(65+i)}")))
+        if not cid or cid in ids:
             continue
-        chars.append({
-            "id": cid,
-            "name": str(c.get("name", cid)).strip(),
-            "role": str(c.get("role", "")).strip(),
-            "detailed_visual_profile": str(c.get("detailed_visual_profile", "")).strip(),
-        })
-    valid_ids = {c["id"] for c in chars}
+        prof = str(c.get("detailed_visual_profile", "")).strip()
+        if not prof:
+            continue
+        ids.add(cid)
+        chars.append({"id": cid, "name": str(c.get("name", cid)).strip() or cid,
+                      "detailed_visual_profile": prof})
+    if not chars:
+        raise RuntimeError("Screenplay did not include valid characters.")
     scenes = []
-    for i, s in enumerate(data.get("scenes", [])[:scene_count]):
-        focus = [str(f).strip().upper().replace(" ", "_") for f in s.get("character_focus", [])]
-        focus = [f for f in focus if f in valid_ids]
+    raw_scenes = raw.get("scenes", [])[:expected_scenes]
+    for i, s in enumerate(raw_scenes):
+        num = i + 1
+        focus = [_clean_id(str(f)) for f in s.get("character_focus", []) if str(f).strip()]
+        focus = [f for f in dict.fromkeys(focus) if f in ids] or [chars[0]["id"]]
+        lines_raw = s.get("dialogue_lines") or []
+        lines = []
+        for j, ln in enumerate(lines_raw[:3]):
+            cid = _clean_id(str(ln.get("character_id", "")))
+            txt = str(ln.get("text", "")).strip()
+            if not txt or cid not in focus:
+                continue
+            lines.append({"line_id": f"scene-{num}-line-{j+1}", "character_id": cid,
+                          "text": txt, "order": len(lines) + 1})
+        dialogue = " ".join(l["text"] for l in lines) if lines else str(s.get("dialogue", "")).strip()
+        dur = s.get("duration_seconds")
+        dur = dur if dur in (3, 4) else 4
         scenes.append({
-            "scene_number": i + 1,
-            "heading": str(s.get("heading", f"SCENE {i + 1}")).strip(),
-            "description": str(s.get("description", "")).strip(),
+            "scene_number": num,
+            "character_focus": focus,
             "visual_prompt": str(s.get("visual_prompt", "")).strip(),
-            "camera_movement": str(s.get("camera_movement", "")).strip(),
-            "dialogue": str(s.get("dialogue", "")).strip(),
-            "character_focus": focus or ([chars[0]["id"]] if chars else []),
+            "camera_movement": str(s.get("camera_movement", "slow cinematic push-in")).strip(),
+            "dialogue": dialogue,
+            "dialogue_lines": lines,
+            "duration_seconds": dur,
         })
-    return {
-        "project_title": str(data.get("project_title", title)).strip(),
-        "global_style": str(data.get("global_style", art_style)).strip(),
-        "characters": chars,
-        "scenes": scenes,
-    }
+    if not scenes:
+        raise RuntimeError("Screenplay did not include valid scenes.")
+    return {"project_title": title, "global_style": gstyle, "characters": chars, "scenes": scenes}
 
 
 # ---------------------------------------------------------------------------
-# Images
+# Images (faithful reference prompts)
 # ---------------------------------------------------------------------------
 async def _generate_image(prompt: str, reference_images: Optional[list[bytes]] = None) -> bytes:
-    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=new_id(),
-                   system_message="You are a world-class cinematic concept artist.")
-    chat.with_model("gemini", IMAGE_MODEL).with_params(modalities=["image", "text"])
-    file_contents = None
-    if reference_images:
-        file_contents = [ImageContent(base64.b64encode(b).decode("utf-8")) for b in reference_images]
-    msg = UserMessage(text=prompt, file_contents=file_contents) if file_contents \
-        else UserMessage(text=prompt)
-    _, images = await chat.send_message_multimodal_response(msg)
-    if not images:
-        raise RuntimeError("Image generation returned no image")
-    return base64.b64decode(images[0]["data"])
+    files = [ImageContent(base64.b64encode(b).decode("utf-8")) for b in (reference_images or [])]
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=new_id(),
+                           system_message="You are a world-class cinematic concept artist.")
+            chat.with_model("gemini", IMAGE_MODEL).with_params(modalities=["image", "text"])
+            msg = UserMessage(text=prompt, file_contents=files) if files else UserMessage(text=prompt)
+            _, images = await chat.send_message_multimodal_response(msg)
+            if images:
+                return base64.b64decode(images[0]["data"])
+            last_err = RuntimeError("Image generation returned no image")
+        except Exception as e:  # transient upstream errors (e.g. 502) — retry a couple of times
+            last_err = e
+        if attempt < 2:
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_err or RuntimeError("Image generation failed")
 
 
-async def generate_character_image(global_style: str, profile: dict, orientation: str) -> bytes:
-    prompt = (
-        f"Full-body character reference portrait of {profile.get('name', 'a character')}. "
-        f"{profile.get('detailed_visual_profile', '')}. "
-        f"Cinematic {global_style}. Neutral studio backdrop, {_orientation_hint(orientation)}, "
-        "sharp focus, high detail, single subject, natural expression, no text, no watermark."
-    )
-    return await _generate_image(prompt)
-
-
-async def generate_scene_image(global_style: str, scene: dict, orientation: str,
-                               reference_images: list[bytes]) -> bytes:
-    prompt = (
-        f"Cinematic film still storyboard frame. {scene.get('visual_prompt', '')}. "
-        f"Camera: {scene.get('camera_movement', '')}. "
-        f"Consistent look: {global_style}. {_orientation_hint(orientation)}. "
-        "Reuse the exact same characters shown in the supplied reference images — keep their "
-        "faces, hair, and wardrobe identical. Filmic lighting, high detail, no text, no watermark."
-    )
-    return await _generate_image(prompt, reference_images=reference_images or None)
-
-
-# ---------------------------------------------------------------------------
-# Video (Replicate + Luma Ray 3.2)
-# ---------------------------------------------------------------------------
-def build_motion_prompt(global_style: str, scene: dict, orientation: str) -> str:
-    hint = "vertical 9:16" if orientation == "vertical" else "horizontal 16:9"
+def build_character_reference_prompt(character: dict, global_style: str, seed: int, orientation: str) -> str:
+    frame = _frame_direction(orientation, "long")
     return (
-        f"Create one continuous five-second {hint} cinematic drama shot from the supplied first "
-        f"frame. {scene.get('visual_prompt', '')}. Camera motion: "
-        f"{scene.get('camera_movement', 'slow gentle push-in')}. Preserve the subject identity, "
-        f"faces, wardrobe, lighting and color grade from the first frame. Consistent look: "
-        f"{global_style}. Natural subtle motion, one continuous take, no cutaways, no transitions, "
-        "no on-screen text, no subtitles. Do not generate any audio or soundtrack."
+        f"Create a neutral character reference sheet for a private short-drama production in {frame} format.\n\n"
+        f"Character ID: {character['id']}\nFull detailed visual profile:\n{character['detailed_visual_profile']}\n\n"
+        f"Global visual style:\n{global_style}\n\n"
+        f"Composition direction: one clearly visible character, {frame} framing, head and shoulders with "
+        "enough wardrobe detail to recognize the silhouette, neutral expression, relaxed posture, clean "
+        "studio-like background, even cinematic key light, no action pose, no dialogue, no props that "
+        "obscure the face, no text or watermarks. This is a neutral visual reference image for later "
+        f"storyboard conditioning, not a finished scene.\n\nProject seed anchor: #{seed}. Use this number "
+        "as a textual consistency cue alongside the profile."
     )
 
 
-class ReplicateError(RuntimeError):
+def build_scene_storyboard_prompt(scene: dict, characters: list[dict], global_style: str,
+                                  seed: int, orientation: str) -> str:
+    frame = _frame_direction(orientation, "short")
+    by_id = {c["id"]: c for c in characters}
+    profiles = "\n".join(f"{cid}: {by_id[cid]['detailed_visual_profile']}"
+                         for cid in scene["character_focus"] if cid in by_id)
+    return (
+        f"Create a cinematic storyboard image for Scene {scene['scene_number']} of a short drama in {frame} format.\n\n"
+        f"Global visual style:\n{global_style}\n\nExact scene visual prompt:\n{scene['visual_prompt']}\n\n"
+        f"Exact camera movement direction to imply in the still composition:\n{scene['camera_movement']}\n\n"
+        f"Characters in focus and their full visual profiles:\n{profiles}\n\n"
+        f"Frame direction: {frame} composition, strong foreground and background depth, expressive physical "
+        "action frozen at a dramatic beat, clear faces and wardrobe, lighting that matches the global style, "
+        "polished cinematic realism, no subtitles, no logos, no watermarks, no extra characters. Reuse the "
+        "exact same characters from the supplied reference images — keep their faces, hair, and wardrobe "
+        f"identical.\n\nProject seed anchor: #{seed}."
+    )
+
+
+async def generate_character_image(character: dict, global_style: str, seed: int, orientation: str) -> bytes:
+    return await _generate_image(build_character_reference_prompt(character, global_style, seed, orientation))
+
+
+async def generate_scene_image(scene: dict, characters: list[dict], global_style: str, seed: int,
+                               orientation: str, reference_images: list[bytes]) -> bytes:
+    return await _generate_image(
+        build_scene_storyboard_prompt(scene, characters, global_style, seed, orientation),
+        reference_images=reference_images or None)
+
+
+# ---------------------------------------------------------------------------
+# Replicate (Luma motion + PixVerse lip-sync share the predictions API)
+# ---------------------------------------------------------------------------
+class ProviderError(RuntimeError):
     pass
 
 
 def _replicate_headers() -> dict:
     if not REPLICATE_API_TOKEN or REPLICATE_API_TOKEN.startswith("REPLACE_WITH"):
-        raise ReplicateError("Replicate API token is not configured yet. Add it in backend settings.")
+        raise ProviderError("Replicate API token is not configured yet.")
     return {"Authorization": f"Bearer {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
-
-
-def start_luma_prediction(prompt: str, start_image_url: str) -> dict:
-    payload = {"input": {"prompt": prompt, "start_image": start_image_url, "duration": 5}}
-    r = requests.post(f"{REPLICATE_BASE}/models/{LUMA_MODEL}/predictions",
-                      headers=_replicate_headers(), json=payload, timeout=60)
-    if r.status_code in (401, 403):
-        raise ReplicateError("Replicate rejected the token or Luma Ray 3.2 access is not enabled.")
-    if r.status_code == 429:
-        raise ReplicateError("Replicate is rate-limiting or the account spend limit was reached. "
-                             "Wait a moment and retry this scene.")
-    if not r.ok:
-        detail = ""
-        try:
-            detail = r.json().get("detail") or ""
-        except Exception:
-            detail = (r.text or "")[:200]
-        raise ReplicateError(f"Could not start the Luma render ({r.status_code}). {detail}".strip())
-    data = r.json()
-    return {"prediction_id": data["id"], "status": _norm_status(data.get("status"))}
 
 
 def _norm_status(value) -> str:
@@ -229,39 +303,129 @@ def _norm_status(value) -> str:
     return "QUEUED"
 
 
-def _extract_video_url(output) -> Optional[str]:
+def _extract_url(output) -> Optional[str]:
     if isinstance(output, str) and output.startswith("https://"):
         return output
     if isinstance(output, list):
         for item in output:
-            u = _extract_video_url(item)
+            u = _extract_url(item)
             if u:
                 return u
     if isinstance(output, dict):
-        for k in ("video", "video_url", "url", "output"):
-            u = _extract_video_url(output.get(k))
+        for k in ("video", "video_url", "url", "output", "file_url"):
+            u = _extract_url(output.get(k))
             if u:
                 return u
     return None
 
 
-def poll_luma_prediction(prediction_id: str) -> dict:
+def replicate_start(model: str, inp: dict) -> dict:
+    r = requests.post(f"{REPLICATE_BASE}/models/{model}/predictions",
+                      headers=_replicate_headers(), json={"input": inp}, timeout=60)
+    if r.status_code in (401, 403):
+        raise ProviderError(f"Replicate rejected the token or {model} access is not enabled.")
+    if r.status_code == 429:
+        raise ProviderError("Replicate is rate-limiting or the account spend limit was reached. Retry shortly.")
+    if not r.ok:
+        detail = ""
+        try:
+            detail = r.json().get("detail") or ""
+        except Exception:
+            detail = (r.text or "")[:200]
+        raise ProviderError(f"Could not start {model} ({r.status_code}). {detail}".strip())
+    data = r.json()
+    return {"prediction_id": data["id"], "status": _norm_status(data.get("status"))}
+
+
+def replicate_poll(prediction_id: str) -> dict:
     r = requests.get(f"{REPLICATE_BASE}/predictions/{prediction_id}",
                      headers=_replicate_headers(), timeout=60)
     if not r.ok:
-        raise ReplicateError("Could not fetch the render status. Please retry shortly.")
+        raise ProviderError("Could not fetch the render status. Please retry shortly.")
     data = r.json()
     status = _norm_status(data.get("status"))
-    result = {"status": status}
+    out = {"status": status}
     if status == "SUCCEEDED":
-        result["output_url"] = _extract_video_url(data.get("output"))
-    if status == "FAILED":
-        result["error"] = "Luma could not finish this render. You can retry this scene."
-    return result
+        out["output_url"] = _extract_url(data.get("output"))
+    if status in ("FAILED", "CANCELED"):
+        out["error"] = "The render could not finish. You can retry this shot."
+    return out
 
 
-def download_video(url: str) -> bytes:
+def download_replicate_file(url: str) -> bytes:
     r = requests.get(url, headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
                      timeout=180, allow_redirects=True)
     r.raise_for_status()
+    return r.content
+
+
+def build_master_motion_prompt(global_style: str, scene: dict, orientation: str) -> str:
+    hint = "vertical 9:16" if orientation == "vertical" else "horizontal 16:9"
+    return (
+        f"Animate this storyboard into one continuous five-second {hint} cinematic drama shot. "
+        f"{scene.get('visual_prompt', '')}. Camera motion: {scene.get('camera_movement', 'slow gentle push-in')}. "
+        "Preserve the subject identity, faces, wardrobe, lighting and color grade from the first frame. "
+        f"Consistent look: {global_style}. Natural subtle motion, one continuous take, no cutaways, no "
+        "transitions, no on-screen text, no subtitles. Do not generate any audio or soundtrack."
+    )
+
+
+def start_luma_motion(prompt: str, start_image_url: str) -> dict:
+    return replicate_start(LUMA_MODEL, {"prompt": prompt, "start_image": start_image_url, "duration": 5})
+
+
+def start_pixverse_lipsync(video_url: str, audio_url: str) -> dict:
+    return replicate_start(PIXVERSE_MODEL, {"video": video_url, "audio": audio_url})
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs (faithful reference settings)
+# ---------------------------------------------------------------------------
+ELEVEN_VOICES_URL = "https://api.elevenlabs.io/v2/voices?page_size=100"
+ELEVEN_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+
+
+def _eleven_headers() -> dict:
+    if not ELEVENLABS_API_KEY:
+        raise ProviderError("The ElevenLabs voice key is not configured yet.")
+    return {"xi-api-key": ELEVENLABS_API_KEY}
+
+
+def list_voices() -> list[dict]:
+    r = requests.get(ELEVEN_VOICES_URL, headers={**_eleven_headers(), "Accept": "application/json"}, timeout=30)
+    if r.status_code in (401, 403):
+        raise ProviderError("ElevenLabs rejected the voice key.")
+    if not r.ok:
+        raise ProviderError("Could not load ElevenLabs voices. Retry shortly.")
+    voices = r.json().get("voices", [])
+    out = []
+    for v in voices:
+        labels = v.get("labels") or {}
+        out.append({
+            "voice_id": v.get("voice_id"),
+            "name": v.get("name"),
+            "gender": labels.get("gender"),
+            "accent": labels.get("accent"),
+            "description": v.get("description") or labels.get("description"),
+            "category": v.get("category"),
+        })
+    return [v for v in out if v["voice_id"] and v["name"]]
+
+
+def synthesize_voice(voice_id: str, text: str) -> bytes:
+    r = requests.post(
+        f"{ELEVEN_TTS_URL}/{voice_id}?output_format=mp3_44100_128",
+        headers={**_eleven_headers(), "Content-Type": "application/json"},
+        json={
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.52, "similarity_boost": 0.78,
+                               "style": 0.12, "use_speaker_boost": True},
+        },
+        timeout=90,
+    )
+    if r.status_code in (401, 403):
+        raise ProviderError("ElevenLabs rejected the voice key.")
+    if not r.ok:
+        raise ProviderError("ElevenLabs could not synthesize this line. Retry shortly.")
     return r.content

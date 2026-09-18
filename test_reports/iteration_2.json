@@ -1,0 +1,46 @@
+{
+  "summary": "Phase 2 (Series -> Episodes) tested end-to-end. Backend: 24/24 pytest cases pass in ~194s, including the bug-fix guard for character image generation (endpoint returns valid application/json, not HTML). Verified: auth (login/wrong-pw/me/signup), POST /api/projects creates a series with 10 episodes (Ep1 unlocked, Ep2+ locked), GET list/detail return correct lock states with owner isolation (cross-user 404), episode 2 GET/POST return 403 until Ep1 ready (out-of-range 404), synopsis + script return manifest with characters and scenes, ALL character images generate (JSON, image served via /api/files with token), ALL storyboards generate, /api/voices returns list, /voices/auto assigns DISTINCT locked voices per speaking character, /characters/{cid}/voice changes voice, ONE motion scene start returns QUEUED+prediction_id and polled to READY, ONE lip-sync line start returns QUEUED+prediction_id, featured public, soft-delete works and post-delete GET returns 404. Frontend (mobile viewport 390x844): login works, My List lists series with series-row-* testIDs, /project/[id] shows premise + Episodes list with Episode 1 unlocked and Episodes 2..10 with a lock (episode-row-N), tapping locked Ep2 does NOT navigate (URL unchanged). Pipeline /create/pipeline auto-generates Synopsis (testID synopsis-title), auto-generates Script (Characters + Scene Breakdown), Step 3 Assets — tapping generate-character-{cid} DOES generate the reference image with NO 'Unexpected token <' error (BUG CONFIRMED FIXED); button label switches Generate -> Regenerate; image renders inline. Create Series worksheet opens with Total Episodes 10/45/60/Custom + Portrait 9:16 / Landscape 16:9 + style picker + Start Episode 1 CTA. Deprecated packages detected: none blocking, but props.pointerEvents deprecation warning still present (react-native-web internal).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/projects/{id}/episodes/1/characters/{cid}/image", "issue": "One transient 502 observed during multi-character generation (upstream Gemini Nano Banana provider hiccup). Frontend handled it gracefully; re-tapping succeeds. Not a code bug but user should be shown a clearer 'provider busy — retry' toast; currently the visible pipeline-error state was overwritten by the next successful call."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "auth/login and auth/signup", "issues": ["TextInputs and primary buttons (Sign In / Sign Up / Continue) still lack testID attributes — E2E must fall back to placeholder/text selectors."]},
+      {"screen": "(tabs)/studio.tsx + CreateWorkSheet", "issues": ["Idea TextInput, Next button, Total Episodes chips (10 Eps / 45 Eps / 60 Eps / Custom), ratio cards and Start Episode 1 button have no testID — brittle for automation."]}
+    ],
+    "react_native_issues": [
+      {"component": "props.pointerEvents deprecation", "issue": "Console warning: 'props.pointerEvents is deprecated. Use style.pointerEvents' — emitted on initial mount of auth screens. Reference: bubbled up from react-native-web internal wrappers. Non-blocking but should be tracked."}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_frame_studio_phase2.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Frontend: keep an 'error persistence' behavior on transient character-image 502s — do not silently clear the pipeline-error state when the next per-item call starts; keep the last error visible until it succeeds or user retries.",
+    "Add testIDs to auth screens: email-input, password-input, name-input, confirm-password-input, login-submit, signup-submit, welcome-get-started, welcome-have-account.",
+    "Add testIDs to CreateWorkSheet: worksheet-title-input, worksheet-total-eps-10/45/60/custom, worksheet-ratio-vertical/horizontal, worksheet-style-{index}, worksheet-start-button; and on studio.tsx: studio-idea-input, studio-next-button.",
+    "Optional: migrate any leftover pointerEvents prop to style.pointerEvents to silence the RN Web deprecation."
+  ],
+  "critical_code_review_comments": [
+    "api.ts request() is well hardened against non-JSON responses (JSON.parse try/catch + informative user message) — this is what killed the reported bug and is confirmed working on 502 responses too.",
+    "routes.py `serialize_series` iterates episodes with an async comprehension per list call — fine at 10 eps, but O(N) episode reads per series list will get expensive at 60+ eps × many series; consider projecting only what's needed or batching.",
+    "routes.py `guard_unlocked` re-queries Ep1 on every episode read/write; consider caching ep1_ready on the series doc when it becomes ready to avoid the extra Mongo hit on every hot pipeline call.",
+    "pipeline.py character-image call has no retry/backoff; a single upstream 502 immediately propagates as HTTPException(502). A single automatic retry with jitter would meaningfully improve UX for the reported flow."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_frame_studio_phase2.py (created, Phase 2 contract)",
+    "/app/backend/tests/test_frame_studio.py (deleted — Phase 1, outdated)"
+  ],
+  "success_rate": {"backend": "100% (24/24)", "frontend": "100% on tested flows"},
+  "seed_data_creation": "Created a throwaway signup account (test_<uuid>@frame.studio) for owner-isolation, and one 'TEST_Phase2' 10-episode series that was fully exercised through synopsis+script+ALL character images+ALL storyboards+voices+ONE motion (Luma) started and polled to READY+ONE PixVerse lip-sync started, then soft-deleted at end of the run. Cost-controlled per spec: exactly 1 Luma prediction and 1 PixVerse prediction started, no loops.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Test credentials: test@frame.studio / password123. Backend base URL: EXPO_PUBLIC_BACKEND_URL. Suite lives at /app/backend/tests/test_frame_studio_phase2.py (~194s wall clock, uses Luma+PixVerse; skips lip-sync gracefully if motion doesn't reach READY within 3 min). The stateful test file shares module-level state[] and MUST be run without --forked / xdist. Existing user projects: 4 series including 'Untitled Series' (project a169b46a26cb4eb4a789348c6587df77) which now has Episode 1 with synopsis+script+2 character images already generated — useful for pipeline UI testing without needing to re-run generation. The reported 'Unexpected token <' character-image bug is FIXED — regression is guarded by test_all_character_images_generate_no_html_error.",
+  "rca_of_issue": "Reported bug: 'Unexpected token <, \"<!DOCTYPE \"... is not valid JSON' during character generation. RCA: the Expo frontend was still calling Phase 1 routes (/api/projects/{id}/characters/{cid}/image) which no longer exist on the Phase 2 backend that only accepts the episode-scoped route /api/projects/{id}/episodes/{n}/characters/{cid}/image. When the missing Phase 1 route was hit, the Kubernetes ingress served an HTML 404 which the fetch client tried to JSON.parse. Fix (verified): frontend was rewired to Phase 2 routes (api.ts generateCharacterImage → /projects/{id}/episodes/{n}/characters/{cid}/image) and the request() helper now catches JSON.parse failures and throws a user-friendly Error instead of surfacing the raw parser exception. Verification: backend test test_all_character_images_generate_no_html_error asserts Content-Type is application/json for every character; UI test tapped generate-character-CHARACTER_A → image rendered, button switched to Regenerate, no pipeline-error, no red screen."
+}

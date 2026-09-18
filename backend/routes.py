@@ -1,5 +1,5 @@
-"""All API routes for Frame Studio."""
-from datetime import datetime, timezone
+"""Frame Studio API — series (projects) with lazy episodes and the full
+reference pipeline: synopsis -> script -> assets -> motion -> voice -> lip-sync."""
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -10,6 +10,8 @@ import core
 import pipeline
 
 router = APIRouter(prefix="/api")
+
+EPISODE_SCENES = 5  # scenes per episode (targets a ~1 minute assembled episode)
 
 
 # ---------------------------------------------------------------------------
@@ -33,34 +35,63 @@ class LoginBody(BaseModel):
     password: str
 
 
-class ProjectBody(BaseModel):
+class SeriesBody(BaseModel):
     title: str = Field(default="", max_length=70)
     prompt: str = Field(min_length=1, max_length=20000)
     orientation: str = "vertical"
     art_style: str = "Live-Action Film"
-    scene_count: int = Field(default=4, ge=3, le=6)
+    total_episodes: int = Field(default=10, ge=1, le=120)
+
+
+class VoiceBody(BaseModel):
+    voice_id: str
+    voice_name: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Auth helpers
 # ---------------------------------------------------------------------------
 def public_user(u: dict) -> dict:
     return {"id": u["id"], "name": u.get("name", ""), "email": u["email"],
             "created_at": u.get("created_at")}
 
 
-async def get_owned_project(project_id: str, user: dict) -> dict:
+async def get_series(project_id: str, user: dict) -> dict:
     p = await core.db.projects.find_one(
         {"id": project_id, "owner_id": user["id"], "deleted_at": None}, {"_id": 0})
     if not p:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(status_code=404, detail="Series not found")
     return p
 
 
-def _find_asset(project: dict, asset_type: str, *, character_id: str = None,
-                scene_number: int = None) -> Optional[dict]:
-    for a in project.get("frame_assets", []):
-        if a.get("asset_type") != asset_type:
+async def get_episode_doc(project_id: str, n: int, user: dict, create: bool = False) -> Optional[dict]:
+    ep = await core.db.episodes.find_one(
+        {"project_id": project_id, "owner_id": user["id"], "episode_number": n}, {"_id": 0})
+    if ep or not create:
+        return ep
+    ep = {
+        "id": core.new_id(), "project_id": project_id, "owner_id": user["id"],
+        "episode_number": n, "status": "DRAFT", "synopsis": "", "manifest": None,
+        "frame_assets": [], "video_clips": [], "voice_assignments": [],
+        "audio_assets": [], "lipsync_clips": [],
+        "created_at": core.now_iso(), "updated_at": core.now_iso(),
+    }
+    await core.db.episodes.insert_one(ep)
+    return ep
+
+
+async def ep_update(episode_id: str, changes: dict) -> dict:
+    changes["updated_at"] = core.now_iso()
+    await core.db.episodes.update_one({"id": episode_id}, {"$set": changes})
+    return await core.db.episodes.find_one({"id": episode_id}, {"_id": 0})
+
+
+# ---------------------------------------------------------------------------
+# Status / serialization
+# ---------------------------------------------------------------------------
+def _asset(ep: dict, atype: str, *, character_id=None, scene_number=None):
+    for a in ep.get("frame_assets", []):
+        if a.get("asset_type") != atype:
             continue
         if character_id is not None and a.get("character_id") == character_id:
             return a
@@ -69,73 +100,180 @@ def _find_asset(project: dict, asset_type: str, *, character_id: str = None,
     return None
 
 
-def serialize_project(project: dict) -> dict:
-    manifest = project.get("manifest")
-    characters = []
-    scenes = []
+def _master_clip(ep: dict, scene_number: int):
+    return next((c for c in ep.get("video_clips", []) if c["scene_number"] == scene_number), None)
+
+
+def _line_audio(ep: dict, scene_number: int, line_id: str):
+    return next((a for a in ep.get("audio_assets", [])
+                 if a["scene_number"] == scene_number and a["line_id"] == line_id), None)
+
+
+def _line_shot(ep: dict, scene_number: int, line_id: str):
+    return next((c for c in ep.get("lipsync_clips", [])
+                 if c["scene_number"] == scene_number and c["line_id"] == line_id), None)
+
+
+def episode_is_ready(ep: dict) -> bool:
+    manifest = ep.get("manifest")
+    if not manifest:
+        return False
+    for s in manifest["scenes"]:
+        clip = _master_clip(ep, s["scene_number"])
+        if not clip or clip.get("status") != "READY":
+            return False
+        for line in s.get("dialogue_lines", []):
+            shot = _line_shot(ep, s["scene_number"], line["line_id"])
+            if not shot or shot.get("status") != "READY":
+                return False
+    return True
+
+
+def episode_status(ep: dict) -> str:
+    manifest = ep.get("manifest")
+    if not ep.get("synopsis"):
+        return "DRAFT"
+    if not manifest:
+        return "SYNOPSIS"
+    chars_done = all(_asset(ep, "character_reference", character_id=c["id"]) for c in manifest["characters"])
+    boards_done = all(_asset(ep, "scene_storyboard", scene_number=s["scene_number"]) for s in manifest["scenes"])
+    if not (chars_done and boards_done):
+        return "ASSETS"
+    motion_done = all((_master_clip(ep, s["scene_number"]) or {}).get("status") == "READY"
+                      for s in manifest["scenes"])
+    if not motion_done:
+        return "MOTION"
+    if episode_is_ready(ep):
+        return "READY"
+    return "VOICE"
+
+
+def serialize_episode(series: dict, ep: dict) -> dict:
+    manifest = ep.get("manifest")
+    orientation = series.get("orientation", "vertical")
+    characters, scenes = [], []
     if manifest:
-        for c in manifest.get("characters", []):
-            asset = _find_asset(project, "character_reference", character_id=c["id"])
-            characters.append({**c,
-                               "image_url": core.media_url(asset["storage_path"]) if asset else None})
-        clips_by_scene = {clip["scene_number"]: clip for clip in project.get("video_clips", [])}
-        for s in manifest.get("scenes", []):
-            sb = _find_asset(project, "scene_storyboard", scene_number=s["scene_number"])
-            clip = clips_by_scene.get(s["scene_number"])
-            clip_out = None
-            if clip:
-                clip_out = {
-                    "status": clip.get("status"),
-                    "prediction_id": clip.get("prediction_id"),
-                    "error": clip.get("error"),
-                    "video_url": core.media_url(clip["storage_path"])
-                    if clip.get("storage_path") else None,
-                }
-            scenes.append({**s,
-                           "storyboard_url": core.media_url(sb["storage_path"]) if sb else None,
-                           "clip": clip_out})
+        voices = {v["character_id"]: v for v in ep.get("voice_assignments", [])}
+        for c in manifest["characters"]:
+            asset = _asset(ep, "character_reference", character_id=c["id"])
+            v = voices.get(c["id"])
+            characters.append({
+                **c,
+                "image_url": core.media_url(asset["storage_path"]) if asset else None,
+                "voice": {"voice_id": v["voice_id"], "voice_name": v["voice_name"]} if v else None,
+            })
+        for s in manifest["scenes"]:
+            sb = _asset(ep, "scene_storyboard", scene_number=s["scene_number"])
+            master = _master_clip(ep, s["scene_number"])
+            master_out = None
+            if master:
+                master_out = {"status": master.get("status"), "error": master.get("error"),
+                              "video_url": core.media_url(master["storage_path"]) if master.get("storage_path") else None}
+            lines = []
+            for line in s.get("dialogue_lines", []):
+                audio = _line_audio(ep, s["scene_number"], line["line_id"])
+                shot = _line_shot(ep, s["scene_number"], line["line_id"])
+                lines.append({
+                    **line,
+                    "audio_url": core.media_url(audio["storage_path"]) if audio else None,
+                    "shot": {"status": shot.get("status"), "error": shot.get("error"),
+                             "video_url": core.media_url(shot["storage_path"]) if shot.get("storage_path") else None}
+                    if shot else None,
+                })
+            scenes.append({
+                **s,
+                "storyboard_url": core.media_url(sb["storage_path"]) if sb else None,
+                "master": master_out,
+                "lines": lines,
+            })
+    # Preview playlist (master then dialogue shots, in scene order)
+    shots = []
+    for s in scenes:
+        if s["master"] and s["master"]["video_url"]:
+            shots.append({"type": "master", "scene_number": s["scene_number"], "video_url": s["master"]["video_url"]})
+        for line in s["lines"]:
+            if line["shot"] and line["shot"]["video_url"]:
+                shots.append({"type": "dialogue", "scene_number": s["scene_number"],
+                              "line_id": line["line_id"], "video_url": line["shot"]["video_url"]})
     return {
-        "id": project["id"],
-        "title": project.get("title", ""),
-        "prompt": project.get("prompt", ""),
-        "orientation": project.get("orientation", "vertical"),
-        "art_style": project.get("art_style", ""),
-        "scene_count": project.get("scene_count", 4),
-        "status": project.get("status", "DRAFT"),
-        "synopsis": project.get("synopsis", ""),
+        "id": ep["id"],
+        "project_id": ep["project_id"],
+        "episode_number": ep["episode_number"],
+        "status": episode_status(ep),
+        "ready": episode_is_ready(ep),
+        "orientation": orientation,
+        "synopsis": ep.get("synopsis", ""),
         "global_style": manifest.get("global_style", "") if manifest else "",
         "characters": characters,
         "scenes": scenes,
-        "created_at": project.get("created_at"),
-        "updated_at": project.get("updated_at"),
+        "preview": {"shots": shots, "total_seconds": len(shots) * 5},
+        "series_title": series.get("title", ""),
     }
 
 
-async def _touch(project_id: str, changes: dict) -> dict:
-    changes["updated_at"] = core.now_iso()
-    await core.db.projects.update_one({"id": project_id}, {"$set": changes})
-    return await core.db.projects.find_one({"id": project_id}, {"_id": 0})
+async def serialize_series(series: dict, user: dict) -> dict:
+    eps = {e["episode_number"]: e async for e in core.db.episodes.find(
+        {"project_id": series["id"], "owner_id": user["id"]}, {"_id": 0})}
+    ep1 = eps.get(1)
+    ep1_ready = bool(ep1 and episode_is_ready(ep1))
+    episodes = []
+    for n in range(1, series.get("total_episodes", 1) + 1):
+        e = eps.get(n)
+        locked = n > 1 and not ep1_ready
+        episodes.append({
+            "episode_number": n,
+            "status": episode_status(e) if e else "NOT_STARTED",
+            "ready": bool(e and episode_is_ready(e)),
+            "locked": locked,
+            "started": bool(e),
+        })
+    return {
+        "id": series["id"],
+        "title": series.get("title", ""),
+        "prompt": series.get("prompt", ""),
+        "orientation": series.get("orientation", "vertical"),
+        "art_style": series.get("art_style", ""),
+        "total_episodes": series.get("total_episodes", 1),
+        "episodes": episodes,
+        "ep1_ready": ep1_ready,
+        "created_at": series.get("created_at"),
+        "updated_at": series.get("updated_at"),
+    }
+
+
+async def guard_unlocked(series: dict, n: int, user: dict):
+    """Episodes 2..N are locked until episode 1 is fully ready."""
+    if n <= 1:
+        return
+    ep1 = await get_episode_doc(series["id"], 1, user)
+    if not (ep1 and episode_is_ready(ep1)):
+        raise HTTPException(status_code=403, detail="Complete Episode 1 first to unlock this episode.")
+
+
+async def prior_context(series: dict, n: int, user: dict) -> str:
+    if n <= 1:
+        return ""
+    parts = []
+    async for e in core.db.episodes.find(
+            {"project_id": series["id"], "owner_id": user["id"], "episode_number": {"$lt": n}},
+            {"_id": 0}).sort("episode_number", 1):
+        if e.get("synopsis"):
+            parts.append(f"Episode {e['episode_number']}: {e['synopsis']}")
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Auth
+# Auth routes
 # ---------------------------------------------------------------------------
 @router.post("/auth/signup")
 async def signup(body: SignupBody):
     email = str(body.email).strip().lower()
-    existing = await core.db.users.find_one({"email": email})
-    if existing:
+    if await core.db.users.find_one({"email": email}):
         raise HTTPException(status_code=409, detail="Email is already registered")
-    user = {
-        "id": core.new_id(),
-        "name": body.name.strip(),
-        "email": email,
-        "hashed_password": core.hash_password(body.password),
-        "created_at": core.now_iso(),
-    }
+    user = {"id": core.new_id(), "name": body.name.strip(), "email": email,
+            "hashed_password": core.hash_password(body.password), "created_at": core.now_iso()}
     await core.db.users.insert_one(user)
-    token = core.make_access_token(user["id"])
-    return {"token": token, "user": public_user(user)}
+    return {"token": core.make_access_token(user["id"]), "user": public_user(user)}
 
 
 @router.post("/auth/login")
@@ -145,8 +283,7 @@ async def login(body: LoginBody):
     stored = user["hashed_password"] if user else core.DUMMY_HASH
     if not user or not core.verify_password(body.password, stored):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
-    token = core.make_access_token(user["id"])
-    return {"token": token, "user": public_user(user)}
+    return {"token": core.make_access_token(user["id"]), "user": public_user(user)}
 
 
 @router.get("/auth/me")
@@ -155,221 +292,408 @@ async def me(user: core.CurrentUser):
 
 
 # ---------------------------------------------------------------------------
-# Projects
+# Series (projects)
 # ---------------------------------------------------------------------------
 @router.post("/projects")
-async def create_project(body: ProjectBody, user: core.CurrentUser):
-    project = {
-        "id": core.new_id(),
-        "owner_id": user["id"],
-        "title": body.title.strip(),
-        "prompt": body.prompt.strip(),
-        "orientation": body.orientation,
-        "art_style": body.art_style,
-        "scene_count": body.scene_count,
-        "status": "DRAFT",
-        "synopsis": "",
-        "manifest": None,
-        "frame_assets": [],
-        "video_clips": [],
-        "created_at": core.now_iso(),
-        "updated_at": core.now_iso(),
-        "deleted_at": None,
+async def create_series(body: SeriesBody, user: core.CurrentUser):
+    series = {
+        "id": core.new_id(), "owner_id": user["id"], "title": body.title.strip(),
+        "prompt": body.prompt.strip(), "orientation": body.orientation,
+        "art_style": body.art_style, "global_style": pipeline.resolve_global_style(body.art_style),
+        "total_episodes": body.total_episodes, "seed": core.new_seed(),
+        "created_at": core.now_iso(), "updated_at": core.now_iso(), "deleted_at": None,
     }
-    await core.db.projects.insert_one(project)
-    return serialize_project(project)
+    await core.db.projects.insert_one(series)
+    return await serialize_series(series, user)
 
 
 @router.get("/projects")
-async def list_projects(user: core.CurrentUser):
-    cursor = core.db.projects.find(
-        {"owner_id": user["id"], "deleted_at": None}, {"_id": 0}).sort("created_at", -1)
-    return [serialize_project(p) async for p in cursor]
+async def list_series(user: core.CurrentUser):
+    cursor = core.db.projects.find({"owner_id": user["id"], "deleted_at": None}, {"_id": 0}).sort("created_at", -1)
+    return [await serialize_series(p, user) async for p in cursor]
 
 
 @router.get("/projects/{project_id}")
-async def get_project(project_id: str, user: core.CurrentUser):
-    return serialize_project(await get_owned_project(project_id, user))
+async def get_one_series(project_id: str, user: core.CurrentUser):
+    return await serialize_series(await get_series(project_id, user), user)
 
 
 @router.delete("/projects/{project_id}")
-async def delete_project(project_id: str, user: core.CurrentUser):
-    await get_owned_project(project_id, user)
-    await core.db.projects.update_one({"id": project_id},
-                                      {"$set": {"deleted_at": core.now_iso()}})
+async def delete_series(project_id: str, user: core.CurrentUser):
+    await get_series(project_id, user)
+    await core.db.projects.update_one({"id": project_id}, {"$set": {"deleted_at": core.now_iso()}})
     return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
-# Pipeline: synopsis
+# Episode read
 # ---------------------------------------------------------------------------
-@router.post("/projects/{project_id}/synopsis")
-async def gen_synopsis(project_id: str, user: core.CurrentUser):
-    p = await get_owned_project(project_id, user)
+@router.get("/projects/{project_id}/episodes/{n}")
+async def get_episode(project_id: str, n: int, user: core.CurrentUser):
+    series = await get_series(project_id, user)
+    if n < 1 or n > series.get("total_episodes", 1):
+        raise HTTPException(status_code=404, detail="Episode out of range")
+    await guard_unlocked(series, n, user)
+    ep = await get_episode_doc(project_id, n, user, create=True)
+    return serialize_episode(series, ep)
+
+
+async def _load_pipeline_episode(project_id: str, n: int, user: dict):
+    series = await get_series(project_id, user)
+    await guard_unlocked(series, n, user)
+    ep = await get_episode_doc(project_id, n, user, create=True)
+    return series, ep
+
+
+# ---------------------------------------------------------------------------
+# Pipeline: synopsis + script
+# ---------------------------------------------------------------------------
+@router.post("/projects/{project_id}/episodes/{n}/synopsis")
+async def gen_synopsis(project_id: str, n: int, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    ctx = await prior_context(series, n, user)
+    premise = f"{series['prompt']}\n\nThis is Episode {n} of the series." if n > 1 else series["prompt"]
     try:
-        result = await pipeline.generate_synopsis(p["prompt"], p["art_style"], p["scene_count"])
+        result = await pipeline.generate_synopsis(
+            premise, series["global_style"], series["orientation"], EPISODE_SCENES, series["seed"], ctx)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Synopsis generation failed: {e}")
-    title = p["title"] or result["title"]
-    p = await _touch(project_id, {"title": title, "synopsis": result["synopsis"],
-                                  "status": "SYNOPSIS"})
-    return serialize_project(p)
+    ep = await ep_update(ep["id"], {"synopsis": result["synopsis"], "status": "SYNOPSIS",
+                                    "proposed_title": result["title"]})
+    if n == 1 and not series.get("title"):
+        await core.db.projects.update_one({"id": project_id},
+                                          {"$set": {"title": result["title"], "updated_at": core.now_iso()}})
+        series = await get_series(project_id, user)
+    return serialize_episode(series, ep)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline: script / manifest
-# ---------------------------------------------------------------------------
-@router.post("/projects/{project_id}/script")
-async def gen_script(project_id: str, user: core.CurrentUser):
-    p = await get_owned_project(project_id, user)
-    if not p.get("synopsis"):
+@router.post("/projects/{project_id}/episodes/{n}/script")
+async def gen_script(project_id: str, n: int, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    if not ep.get("synopsis"):
         raise HTTPException(status_code=400, detail="Generate the synopsis first")
+    ctx = await prior_context(series, n, user)
     try:
         manifest = await pipeline.generate_script(
-            p["prompt"], p["title"], p["synopsis"], p["art_style"],
-            p["orientation"], p["scene_count"])
+            series["prompt"], ep["synopsis"], series["global_style"], series["orientation"],
+            EPISODE_SCENES, series["seed"], ctx)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Script generation failed: {e}")
-    p = await _touch(project_id, {"manifest": manifest, "status": "SCRIPTED",
-                                  "title": p["title"] or manifest["project_title"]})
-    return serialize_project(p)
+    ep = await ep_update(ep["id"], {"manifest": manifest, "status": "ASSETS"})
+    return serialize_episode(series, ep)
 
 
 # ---------------------------------------------------------------------------
-# Pipeline: character image
+# Pipeline: images
 # ---------------------------------------------------------------------------
-@router.post("/projects/{project_id}/characters/{character_id}/image")
-async def gen_character_image(project_id: str, character_id: str, user: core.CurrentUser):
-    p = await get_owned_project(project_id, user)
-    manifest = p.get("manifest")
+@router.post("/projects/{project_id}/episodes/{n}/characters/{cid}/image")
+async def gen_character_image(project_id: str, n: int, cid: str, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    manifest = ep.get("manifest")
     if not manifest:
         raise HTTPException(status_code=400, detail="Generate the script first")
-    profile = next((c for c in manifest["characters"] if c["id"] == character_id), None)
+    profile = next((c for c in manifest["characters"] if c["id"] == cid), None)
     if not profile:
         raise HTTPException(status_code=404, detail="Character not found")
     try:
-        img = await pipeline.generate_character_image(manifest["global_style"], profile,
-                                                      p["orientation"])
+        img = await pipeline.generate_character_image(profile, manifest["global_style"],
+                                                      series["seed"], series["orientation"])
         path = await core.store_bytes(user["id"], img, "png", "image/png")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Image generation failed: {e}")
-    assets = [a for a in p.get("frame_assets", [])
-              if not (a.get("asset_type") == "character_reference"
-                      and a.get("character_id") == character_id)]
-    assets.append({"asset_type": "character_reference", "character_id": character_id,
+        raise HTTPException(status_code=502, detail=f"Character image failed: {e}")
+    assets = [a for a in ep.get("frame_assets", [])
+              if not (a.get("asset_type") == "character_reference" and a.get("character_id") == cid)]
+    assets.append({"asset_type": "character_reference", "character_id": cid,
                    "storage_path": path, "created_at": core.now_iso()})
-    p = await _touch(project_id, {"frame_assets": assets})
-    return serialize_project(p)
+    ep = await ep_update(ep["id"], {"frame_assets": assets})
+    return serialize_episode(series, ep)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline: scene storyboard image
-# ---------------------------------------------------------------------------
-@router.post("/projects/{project_id}/scenes/{scene_number}/storyboard")
-async def gen_storyboard(project_id: str, scene_number: int, user: core.CurrentUser):
-    p = await get_owned_project(project_id, user)
-    manifest = p.get("manifest")
+@router.post("/projects/{project_id}/episodes/{n}/scenes/{s}/storyboard")
+async def gen_storyboard(project_id: str, n: int, s: int, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    manifest = ep.get("manifest")
     if not manifest:
         raise HTTPException(status_code=400, detail="Generate the script first")
-    scene = next((s for s in manifest["scenes"] if s["scene_number"] == scene_number), None)
+    scene = next((sc for sc in manifest["scenes"] if sc["scene_number"] == s), None)
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
-    # gather character reference images for consistency
     refs = []
-    for cid in scene.get("character_focus", []):
-        asset = _find_asset(p, "character_reference", character_id=cid)
-        if asset:
+    for cid in scene["character_focus"]:
+        a = _asset(ep, "character_reference", character_id=cid)
+        if a:
             try:
-                data, _ = await core.load_bytes(asset["storage_path"])
+                data, _ = await core.load_bytes(a["storage_path"])
                 refs.append(data)
             except Exception:
                 pass
+    if not refs:
+        raise HTTPException(status_code=400, detail="Generate the character images for this scene first")
     try:
-        img = await pipeline.generate_scene_image(manifest["global_style"], scene,
-                                                  p["orientation"], refs)
+        img = await pipeline.generate_scene_image(scene, manifest["characters"], manifest["global_style"],
+                                                  series["seed"], series["orientation"], refs)
         path = await core.store_bytes(user["id"], img, "png", "image/png")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Storyboard generation failed: {e}")
-    assets = [a for a in p.get("frame_assets", [])
-              if not (a.get("asset_type") == "scene_storyboard"
-                      and a.get("scene_number") == scene_number)]
-    assets.append({"asset_type": "scene_storyboard", "scene_number": scene_number,
+        raise HTTPException(status_code=502, detail=f"Storyboard failed: {e}")
+    assets = [a for a in ep.get("frame_assets", [])
+              if not (a.get("asset_type") == "scene_storyboard" and a.get("scene_number") == s)]
+    assets.append({"asset_type": "scene_storyboard", "scene_number": s,
                    "storage_path": path, "created_at": core.now_iso()})
-    p = await _touch(project_id, {"frame_assets": assets})
-    return serialize_project(p)
+    ep = await ep_update(ep["id"], {"frame_assets": assets})
+    return serialize_episode(series, ep)
 
 
 # ---------------------------------------------------------------------------
-# Pipeline: scene video (start + poll)
+# Pipeline: scene motion (master clip)
 # ---------------------------------------------------------------------------
-@router.post("/projects/{project_id}/scenes/{scene_number}/video")
-async def start_scene_video(project_id: str, scene_number: int, user: core.CurrentUser):
-    p = await get_owned_project(project_id, user)
-    manifest = p.get("manifest")
-    if not manifest:
-        raise HTTPException(status_code=400, detail="Generate the script first")
-    scene = next((s for s in manifest["scenes"] if s["scene_number"] == scene_number), None)
+@router.post("/projects/{project_id}/episodes/{n}/scenes/{s}/motion")
+async def start_motion(project_id: str, n: int, s: int, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    manifest = ep.get("manifest")
+    scene = next((sc for sc in (manifest or {}).get("scenes", []) if sc["scene_number"] == s), None)
     if not scene:
         raise HTTPException(status_code=404, detail="Scene not found")
-    sb = _find_asset(p, "scene_storyboard", scene_number=scene_number)
+    sb = _asset(ep, "scene_storyboard", scene_number=s)
     if not sb:
-        raise HTTPException(status_code=400,
-                            detail="Generate this scene's storyboard image first")
-    clips = list(p.get("video_clips", []))
-    existing = next((c for c in clips if c["scene_number"] == scene_number), None)
+        raise HTTPException(status_code=400, detail="Generate this scene's storyboard first")
+    clips = list(ep.get("video_clips", []))
+    existing = _master_clip(ep, s)
     if existing and existing.get("status") in ("QUEUED", "PROCESSING", "READY"):
-        return {"scene_number": scene_number, "status": existing["status"],
-                "prediction_id": existing.get("prediction_id")}
-    prompt = pipeline.build_motion_prompt(manifest["global_style"], scene, p["orientation"])
-    start_url = core.media_url(sb["storage_path"])
+        return {"scene_number": s, "status": existing["status"], "prediction_id": existing.get("prediction_id")}
+    prompt = pipeline.build_master_motion_prompt(manifest["global_style"], scene, series["orientation"])
     try:
-        started = pipeline.start_luma_prediction(prompt, start_url)
-    except pipeline.ReplicateError as e:
+        started = pipeline.start_luma_motion(prompt, core.media_url(sb["storage_path"]))
+    except pipeline.ProviderError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    clips = [c for c in clips if c["scene_number"] != scene_number]
-    clips.append({"scene_number": scene_number, "prediction_id": started["prediction_id"],
-                  "status": started["status"], "prompt": prompt, "storage_path": None,
-                  "error": None, "created_at": core.now_iso(), "updated_at": core.now_iso()})
-    await _touch(project_id, {"video_clips": clips})
-    return {"scene_number": scene_number, "status": started["status"],
-            "prediction_id": started["prediction_id"]}
+    clips = [c for c in clips if c["scene_number"] != s]
+    clips.append({"scene_number": s, "prediction_id": started["prediction_id"], "status": started["status"],
+                  "storage_path": None, "error": None, "created_at": core.now_iso(), "updated_at": core.now_iso()})
+    await ep_update(ep["id"], {"video_clips": clips})
+    return {"scene_number": s, "status": started["status"], "prediction_id": started["prediction_id"]}
 
 
-@router.get("/projects/{project_id}/scenes/{scene_number}/video")
-async def poll_scene_video(project_id: str, scene_number: int, user: core.CurrentUser):
-    p = await get_owned_project(project_id, user)
-    clips = list(p.get("video_clips", []))
-    clip = next((c for c in clips if c["scene_number"] == scene_number), None)
+@router.get("/projects/{project_id}/episodes/{n}/scenes/{s}/motion")
+async def poll_motion(project_id: str, n: int, s: int, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    clip = _master_clip(ep, s)
     if not clip:
         raise HTTPException(status_code=404, detail="No render for this scene")
     if clip.get("status") == "READY" and clip.get("storage_path"):
-        return {"scene_number": scene_number, "status": "READY",
-                "video_url": core.media_url(clip["storage_path"])}
+        return {"scene_number": s, "status": "READY", "video_url": core.media_url(clip["storage_path"])}
     try:
-        result = pipeline.poll_luma_prediction(clip["prediction_id"])
-    except pipeline.ReplicateError as e:
+        result = pipeline.replicate_poll(clip["prediction_id"])
+    except pipeline.ProviderError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    status = result["status"]
-    changes = {"status": status, "updated_at": core.now_iso()}
+    changes = {"status": result["status"], "updated_at": core.now_iso()}
     video_url = None
-    if status == "SUCCEEDED" and result.get("output_url"):
+    if result["status"] == "SUCCEEDED" and result.get("output_url"):
         try:
-            data = pipeline.download_video(result["output_url"])
+            data = pipeline.download_replicate_file(result["output_url"])
             path = await core.store_bytes(user["id"], data, "mp4", "video/mp4")
             changes["status"] = "READY"
             changes["storage_path"] = path
             video_url = core.media_url(path)
         except Exception as e:
             changes["status"] = "FAILED"
-            changes["error"] = f"Archiving the clip failed: {e}"
-    elif status == "FAILED":
+            changes["error"] = f"Archiving failed: {e}"
+    elif result["status"] in ("FAILED", "CANCELED"):
         changes["error"] = result.get("error")
-    # persist clip update
+    clips = list(ep.get("video_clips", []))
     for c in clips:
-        if c["scene_number"] == scene_number:
+        if c["scene_number"] == s:
             c.update(changes)
-    await _touch(project_id, {"video_clips": clips})
-    out = {"scene_number": scene_number, "status": changes["status"]}
+    await ep_update(ep["id"], {"video_clips": clips})
+    out = {"scene_number": s, "status": changes["status"]}
+    if video_url:
+        out["video_url"] = video_url
+    if changes.get("error"):
+        out["error"] = changes["error"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Voices
+# ---------------------------------------------------------------------------
+_VOICE_CACHE: list[dict] = []
+
+
+def _voices() -> list[dict]:
+    global _VOICE_CACHE
+    if not _VOICE_CACHE:
+        _VOICE_CACHE = pipeline.list_voices()
+    return _VOICE_CACHE
+
+
+@router.get("/voices")
+async def voices(user: core.CurrentUser):
+    try:
+        return {"voices": _voices()}
+    except pipeline.ProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+def _infer_gender(profile: str) -> Optional[str]:
+    t = profile.lower()
+    fem = sum(t.count(w) for w in (" she ", " her ", "woman", "female", "girl", "lady", "mother", "sister", "daughter"))
+    masc = sum(t.count(w) for w in (" he ", " his ", " him ", " man", "male", "boy", "father", "brother", "son"))
+    if fem > masc:
+        return "female"
+    if masc > fem:
+        return "male"
+    return None
+
+
+async def _ensure_voice(series: dict, ep: dict, character_id: str) -> dict:
+    """Auto-assign a distinct locked voice per character (smart gender casting)."""
+    assignments = list(ep.get("voice_assignments", []))
+    existing = next((v for v in assignments if v["character_id"] == character_id), None)
+    if existing:
+        return existing
+    manifest = ep["manifest"]
+    profile = next((c for c in manifest["characters"] if c["id"] == character_id), None)
+    gender = _infer_gender(profile.get("detailed_visual_profile", "")) if profile else None
+    used = {v["voice_id"] for v in assignments}
+    pool = _voices()
+    candidates = [v for v in pool if v["voice_id"] not in used]
+    if gender:
+        gendered = [v for v in candidates if (v.get("gender") or "").lower() == gender]
+        if gendered:
+            candidates = gendered
+    if not candidates:
+        candidates = [v for v in pool if v["voice_id"] not in used] or pool
+    chosen = candidates[0]
+    assignment = {"character_id": character_id, "voice_id": chosen["voice_id"],
+                  "voice_name": chosen["name"], "updated_at": core.now_iso()}
+    assignments.append(assignment)
+    await ep_update(ep["id"], {"voice_assignments": assignments})
+    ep["voice_assignments"] = assignments
+    return assignment
+
+
+@router.post("/projects/{project_id}/episodes/{n}/voices/auto")
+async def auto_assign_voices(project_id: str, n: int, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    manifest = ep.get("manifest")
+    if not manifest:
+        raise HTTPException(status_code=400, detail="Generate the script first")
+    try:
+        for c in manifest["characters"]:
+            await _ensure_voice(series, ep, c["id"])
+    except pipeline.ProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    ep = await core.db.episodes.find_one({"id": ep["id"]}, {"_id": 0})
+    return serialize_episode(series, ep)
+
+
+@router.post("/projects/{project_id}/episodes/{n}/characters/{cid}/voice")
+async def set_voice(project_id: str, n: int, cid: str, body: VoiceBody, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    name = body.voice_name or next((v["name"] for v in _voices() if v["voice_id"] == body.voice_id), body.voice_id)
+    assignments = [v for v in ep.get("voice_assignments", []) if v["character_id"] != cid]
+    assignments.append({"character_id": cid, "voice_id": body.voice_id, "voice_name": name,
+                        "updated_at": core.now_iso()})
+    ep = await ep_update(ep["id"], {"voice_assignments": assignments})
+    # Re-synthesizing existing lines uses the new voice on next generation.
+    return serialize_episode(series, ep)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline: dialogue shot (TTS + PixVerse lip-sync of the scene master clip)
+# ---------------------------------------------------------------------------
+def _find_line(manifest: dict, s: int, line_id: str):
+    scene = next((sc for sc in manifest["scenes"] if sc["scene_number"] == s), None)
+    if not scene:
+        return None, None
+    line = next((ln for ln in scene.get("dialogue_lines", []) if ln["line_id"] == line_id), None)
+    return scene, line
+
+
+@router.post("/projects/{project_id}/episodes/{n}/scenes/{s}/lines/{line_id}/shot")
+async def start_dialogue_shot(project_id: str, n: int, s: int, line_id: str, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    manifest = ep.get("manifest")
+    if not manifest:
+        raise HTTPException(status_code=400, detail="Generate the script first")
+    scene, line = _find_line(manifest, s, line_id)
+    if not line:
+        raise HTTPException(status_code=404, detail="Dialogue line not found")
+    master = _master_clip(ep, s)
+    if not master or master.get("status") != "READY" or not master.get("storage_path"):
+        raise HTTPException(status_code=400, detail="Generate this scene's motion clip first")
+
+    existing = _line_shot(ep, s, line_id)
+    if existing and existing.get("status") in ("QUEUED", "PROCESSING", "READY"):
+        return {"scene_number": s, "line_id": line_id, "status": existing["status"],
+                "prediction_id": existing.get("prediction_id")}
+
+    # 1) Ensure the line's voice take (locked per-character voice) exists.
+    audio = _line_audio(ep, s, line_id)
+    if not audio:
+        try:
+            assignment = await _ensure_voice(series, ep, line["character_id"])
+            mp3 = pipeline.synthesize_voice(assignment["voice_id"], line["text"])
+            apath = await core.store_bytes(user["id"], mp3, "mp3", "audio/mpeg")
+        except pipeline.ProviderError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Voice synthesis failed: {e}")
+        audio_assets = list(ep.get("audio_assets", []))
+        audio = {"scene_number": s, "line_id": line_id, "character_id": line["character_id"],
+                 "voice_id": assignment["voice_id"], "voice_name": assignment["voice_name"],
+                 "text": line["text"], "storage_path": apath, "created_at": core.now_iso()}
+        audio_assets = [a for a in audio_assets if not (a["scene_number"] == s and a["line_id"] == line_id)]
+        audio_assets.append(audio)
+        ep = await ep_update(ep["id"], {"audio_assets": audio_assets})
+
+    # 2) Start PixVerse lip-sync of the master clip against the line audio.
+    try:
+        started = pipeline.start_pixverse_lipsync(
+            core.media_url(master["storage_path"]), core.media_url(audio["storage_path"]))
+    except pipeline.ProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    shots = [c for c in ep.get("lipsync_clips", []) if not (c["scene_number"] == s and c["line_id"] == line_id)]
+    shots.append({"scene_number": s, "line_id": line_id, "character_id": line["character_id"],
+                  "prediction_id": started["prediction_id"], "status": started["status"],
+                  "storage_path": None, "error": None,
+                  "created_at": core.now_iso(), "updated_at": core.now_iso()})
+    await ep_update(ep["id"], {"lipsync_clips": shots})
+    return {"scene_number": s, "line_id": line_id, "status": started["status"],
+            "prediction_id": started["prediction_id"]}
+
+
+@router.get("/projects/{project_id}/episodes/{n}/scenes/{s}/lines/{line_id}/shot")
+async def poll_dialogue_shot(project_id: str, n: int, s: int, line_id: str, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    shot = _line_shot(ep, s, line_id)
+    if not shot:
+        raise HTTPException(status_code=404, detail="No dialogue shot for this line")
+    if shot.get("status") == "READY" and shot.get("storage_path"):
+        return {"scene_number": s, "line_id": line_id, "status": "READY",
+                "video_url": core.media_url(shot["storage_path"])}
+    try:
+        result = pipeline.replicate_poll(shot["prediction_id"])
+    except pipeline.ProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    changes = {"status": result["status"], "updated_at": core.now_iso()}
+    video_url = None
+    if result["status"] == "SUCCEEDED" and result.get("output_url"):
+        try:
+            data = pipeline.download_replicate_file(result["output_url"])
+            path = await core.store_bytes(user["id"], data, "mp4", "video/mp4")
+            changes["status"] = "READY"
+            changes["storage_path"] = path
+            video_url = core.media_url(path)
+        except Exception as e:
+            changes["status"] = "FAILED"
+            changes["error"] = f"Archiving failed: {e}"
+    elif result["status"] in ("FAILED", "CANCELED"):
+        changes["error"] = result.get("error")
+    shots = list(ep.get("lipsync_clips", []))
+    for c in shots:
+        if c["scene_number"] == s and c["line_id"] == line_id:
+            c.update(changes)
+    await ep_update(ep["id"], {"lipsync_clips": shots})
+    out = {"scene_number": s, "line_id": line_id, "status": changes["status"]}
     if video_url:
         out["video_url"] = video_url
     if changes.get("error"):
@@ -381,7 +705,7 @@ async def poll_scene_video(project_id: str, scene_number: int, user: core.Curren
 # Media file serving
 # ---------------------------------------------------------------------------
 @router.get("/files/{path:path}")
-async def serve_file(path: str, token: Optional[str] = Query(None)):
+async def serve_file(path: str, token: str = Query(None)):
     if not token or not core.verify_media_token(token, path):
         raise HTTPException(status_code=403, detail="Invalid or expired media token")
     try:
@@ -393,7 +717,7 @@ async def serve_file(path: str, token: Optional[str] = Query(None)):
 
 
 # ---------------------------------------------------------------------------
-# Featured / curated content
+# Featured
 # ---------------------------------------------------------------------------
 FEATURED = [
     {"id": "f1", "title": "Ward of Hearts", "genre": "Thriller", "rating": 4.8, "episodes": 45,

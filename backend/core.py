@@ -23,6 +23,7 @@ JWT_ISSUER = os.getenv("JWT_ISSUER", "frame-studio")
 TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "43200"))
 EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 
 # Public base URL used to build externally reachable media links (for the app
 # and for Replicate to fetch start images). Supervisor sets APP_URL.
@@ -39,6 +40,7 @@ db = _client[DB_NAME]
 async def init_indexes():
     await db.users.create_index("email", unique=True)
     await db.projects.create_index("owner_id")
+    await db.episodes.create_index([("project_id", 1), ("episode_number", 1)])
 
 
 def now_iso() -> str:
@@ -47,6 +49,11 @@ def now_iso() -> str:
 
 def new_id() -> str:
     return uuid.uuid4().hex
+
+
+def new_seed() -> int:
+    import random
+    return random.randint(100000, 999999)
 
 
 # ---------------------------------------------------------------------------
