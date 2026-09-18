@@ -67,6 +67,17 @@ Lip-sync (PixVerse, per dialogue line against the scene's master motion clip) �
 - **Bug fixed**: frontend was calling old Phase 1 routes -> `Unexpected token '<' ... <!DOCTYPE`
   on character generation. Fixed by the full Phase 2 rewire + graceful non-JSON error in `request()`.
 
+## Fix (2026-09-18c) — Dialogue shots blocked by content moderation; Retry now works
+- **Symptom:** dialogue "voicing" shots FAILED with "The render could not finish." and Retry never
+  recovered. **Root cause:** Luma Ray 3.2 content-moderation rejected the per-line close-up prompt at
+  submit time because it embedded the scene's violent action ("lunges/snatching for the file");
+  Retry resubmitted the same flagged prompt each time.
+- **Fixes** (`pipeline.py`): (1) the close-up prompt now uses only character identity + global style +
+  the spoken line (scene action/camera dropped), so it passes moderation; (2) `replicate_poll`
+  surfaces a content-policy-specific message; (3) `replicate_start` retries transient 5xx gateway
+  errors. Verified backend-only (8/8), incl. the user's exact previously-failing line now retrying to
+  READY. Known follow-up: orphaned storage paths on re-render aren't cleaned up yet.
+
 ## Fix (2026-09-18b) — Correct-character lip-sync + working re-render
 - **Wrong character lip-syncing** fixed: lip-sync was applied to the multi-character scene master, so
   PixVerse animated the wrong face. Now, faithful to buildy, each dialogue line renders a

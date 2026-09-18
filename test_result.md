@@ -78,3 +78,34 @@
 - Confirm re-render on a READY master motion scene also starts a new render (no READY short-circuit).
 - Do NOT render more than ONE dialogue line and at most ONE extra motion re-render. No frontend E2E renders.
 
+---
+## Iteration 4 — Fix: dialogue close-up blocked by content moderation + retry (verify)
+
+### Root cause
+On the user's series (project `c69332993aec4f1fbbae370a70726c09`), scene-3 dialogue shots kept
+FAILING with the generic "The render could not finish." message and Retry never recovered. Direct
+inspection of the Luma predictions showed the real cause: **Luma Ray 3.2 content-moderation rejected
+the close-up prompt at submit time** ("content_moderated / Prompt rejected by content policy"),
+because the per-line close-up prompt embedded the scene's raw physical action ("CHARACTER_C lunges...
+snatching for the file"). Retry resubmitted the same flagged prompt, so it failed every time.
+
+### Fixes
+1. `pipeline.build_dialogue_closeup_prompt` no longer includes the scene's visual_prompt/camera
+   action. A talking close-up only needs the character identity + global style + the spoken line, so
+   the violent scene action (which trips moderation) is dropped. VERIFIED directly: the exact
+   previously-failing scene-3 close-up now passes moderation and proceeds to PROCESSING.
+2. `pipeline.replicate_poll` now surfaces a content-policy-specific message when the provider flags
+   the render, instead of a generic failure.
+3. `pipeline.replicate_start` now retries transient gateway errors (500/502/503/504) up to 2x.
+
+### Verify (STRICT COST CONTROL)
+- Backend only, reuse project `c69332993aec4f1fbbae370a70726c09` (episode 1) owned by test@frame.studio.
+- Retry line scene-3 / scene-3-line-1 via POST .../scenes/3/lines/scene-3-line-1/shot: confirm it
+  starts (QUEUED/PROCESSING, new closeup_clips record, lipsync stage=CLOSEUP) and does NOT immediately
+  fail with content moderation. Poll to READY for THIS ONE line only.
+- Unit-verify the moderation message path: call pipeline.replicate_poll with a stubbed FAILED response
+  whose error contains "content_moderated" and assert the returned error mentions the content policy
+  (no real render — no cost).
+- Do NOT render any other lines/scenes.
+
+

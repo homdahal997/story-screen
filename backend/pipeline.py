@@ -8,6 +8,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 from typing import Optional
 
 import requests
@@ -320,21 +321,26 @@ def _extract_url(output) -> Optional[str]:
 
 
 def replicate_start(model: str, inp: dict) -> dict:
-    r = requests.post(f"{REPLICATE_BASE}/models/{model}/predictions",
-                      headers=_replicate_headers(), json={"input": inp}, timeout=60)
-    if r.status_code in (401, 403):
-        raise ProviderError(f"Replicate rejected the token or {model} access is not enabled.")
-    if r.status_code == 429:
-        raise ProviderError("Replicate is rate-limiting or the account spend limit was reached. Retry shortly.")
-    if not r.ok:
-        detail = ""
+    last_detail = ""
+    for attempt in range(3):
+        r = requests.post(f"{REPLICATE_BASE}/models/{model}/predictions",
+                          headers=_replicate_headers(), json={"input": inp}, timeout=60)
+        if r.status_code in (401, 403):
+            raise ProviderError(f"Replicate rejected the token or {model} access is not enabled.")
+        if r.status_code == 429:
+            raise ProviderError("Replicate is rate-limiting or the account spend limit was reached. Retry shortly.")
+        if r.ok:
+            data = r.json()
+            return {"prediction_id": data["id"], "status": _norm_status(data.get("status"))}
         try:
-            detail = r.json().get("detail") or ""
+            last_detail = r.json().get("detail") or ""
         except Exception:
-            detail = (r.text or "")[:200]
-        raise ProviderError(f"Could not start {model} ({r.status_code}). {detail}".strip())
-    data = r.json()
-    return {"prediction_id": data["id"], "status": _norm_status(data.get("status"))}
+            last_detail = (r.text or "")[:200]
+        if r.status_code in (500, 502, 503, 504) and attempt < 2:
+            time.sleep(1.5 * (attempt + 1))  # transient gateway hiccup — retry
+            continue
+        break
+    raise ProviderError(f"Could not start {model}. {last_detail}".strip())
 
 
 def replicate_poll(prediction_id: str) -> dict:
@@ -348,7 +354,12 @@ def replicate_poll(prediction_id: str) -> dict:
     if status == "SUCCEEDED":
         out["output_url"] = _extract_url(data.get("output"))
     if status in ("FAILED", "CANCELED"):
-        out["error"] = "The render could not finish. You can retry this shot."
+        raw = str(data.get("error") or "").lower()
+        if any(k in raw for k in ("content", "moderat", "policy", "sensitive", "flagged")):
+            out["error"] = ("This shot was blocked by the video model's content policy. "
+                            "Soften the scene or dialogue wording, then retry.")
+        else:
+            out["error"] = "The render could not finish. You can retry this shot."
     return out
 
 
@@ -378,7 +389,12 @@ def build_dialogue_closeup_prompt(global_style: str, scene: dict, character: dic
                                   line_text: str, orientation: str) -> str:
     """Per-line speaking close-up of a SINGLE character (faithful to reference
     buildDialogueCloseupPrompt). This guarantees only the speaking character is
-    in frame so the lip-sync animates the correct face."""
+    in frame so the lip-sync animates the correct face.
+
+    The scene's raw action/visual prompt is intentionally NOT included: a talking
+    close-up only needs the character's identity, style and the spoken line, and
+    including violent/physical scene action ('lunges', 'grabs', etc.) trips the
+    video model's content-moderation filter and makes the shot fail."""
     hint = "vertical 9:16" if orientation == "vertical" else "horizontal 16:9"
     parts = [
         f"Create one continuous five-second {hint} cinematic drama speaking close-up from the supplied first frame.",
@@ -386,15 +402,13 @@ def build_dialogue_closeup_prompt(global_style: str, scene: dict, character: dic
         "face, hair, wardrobe, lighting, and color grade.",
         f"Frame {character['id']} in a tight medium or head-and-shoulders shot with a frontal or near-frontal "
         "face, readable eyes, and an unobstructed mouth.",
-        "Use steady restrained head movement and minimal camera motion. Keep the performance intimate and controlled.",
-        "Make this one continuous take with no cutaways, transitions, scene changes, extra people, subtitles, "
-        "logos, or text overlays.",
+        "Keep a single speaker only — no other people, cutaways, transitions, scene changes, subtitles, "
+        "logos, or text overlays. Use steady restrained head movement and minimal camera motion; keep the "
+        "performance intimate, natural and controlled.",
         "The mouth movement is visual performance guidance only. Do not generate audio and do not embed a voice or soundtrack.",
         f"Global visual style: {global_style}" if global_style else "",
         f"Saved character profile: {character.get('detailed_visual_profile', '')}" if character.get("detailed_visual_profile") else "",
-        f"Saved scene direction: {scene.get('visual_prompt', '')}" if scene.get("visual_prompt") else "",
-        f"Saved camera context: {scene.get('camera_movement', '')}" if scene.get("camera_movement") else "",
-        f'Exact saved dialogue text for timing guidance only: "{line_text}"',
+        f'The character is delivering this exact spoken line (for mouth-timing guidance only): "{line_text}"',
     ]
     return "\n".join(p for p in parts if p)
 
