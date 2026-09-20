@@ -511,9 +511,12 @@ export default function Pipeline() {
 function buildPlaylist(ep: api.Episode): string[] {
   const urls: string[] = [];
   for (const s of ep.scenes) {
-    const shots = s.lines.filter((l) => l.shot?.status === 'READY' && l.shot.video_url).map((l) => l.shot!.video_url!);
-    if (shots.length) urls.push(...shots);
-    else if (s.master?.status === 'READY' && s.master.video_url) urls.push(s.master.video_url);
+    // A real scene cut: the establishing (silent) master shot first, then the
+    // dialogue close-ups with voice — not close-ups alone.
+    if (s.master?.status === 'READY' && s.master.video_url) urls.push(s.master.video_url);
+    for (const l of s.lines) {
+      if (l.shot?.status === 'READY' && l.shot.video_url) urls.push(l.shot.video_url);
+    }
   }
   return urls;
 }
