@@ -1,8 +1,10 @@
 """Frame Studio API — series (projects) with lazy episodes and the full
 reference pipeline: synopsis -> script -> assets -> motion -> voice -> lip-sync."""
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
@@ -73,7 +75,7 @@ async def get_episode_doc(project_id: str, n: int, user: dict, create: bool = Fa
         "id": core.new_id(), "project_id": project_id, "owner_id": user["id"],
         "episode_number": n, "status": "DRAFT", "synopsis": "", "manifest": None,
         "frame_assets": [], "video_clips": [], "voice_assignments": [],
-        "audio_assets": [], "closeup_clips": [], "lipsync_clips": [],
+        "audio_assets": [], "closeup_clips": [], "lipsync_clips": [], "export": None,
         "created_at": core.now_iso(), "updated_at": core.now_iso(),
     }
     await core.db.episodes.insert_one(ep)
@@ -200,6 +202,12 @@ def serialize_episode(series: dict, ep: dict) -> dict:
             if line["shot"] and line["shot"]["video_url"]:
                 shots.append({"type": "dialogue", "scene_number": s["scene_number"],
                               "line_id": line["line_id"], "video_url": line["shot"]["video_url"]})
+    exp = ep.get("export") or {}
+    export_out = {"status": exp.get("status", "NONE")}
+    if exp.get("status") == "READY" and exp.get("storage_path"):
+        export_out["download_url"] = core.media_url(exp["storage_path"])
+    if exp.get("error"):
+        export_out["error"] = exp["error"]
     return {
         "id": ep["id"],
         "project_id": ep["project_id"],
@@ -212,6 +220,7 @@ def serialize_episode(series: dict, ep: dict) -> dict:
         "characters": characters,
         "scenes": scenes,
         "preview": {"shots": shots, "total_seconds": len(shots) * 5},
+        "export": export_out,
         "series_title": series.get("title", ""),
     }
 
@@ -844,6 +853,66 @@ async def poll_dialogue_shot(project_id: str, n: int, s: int, line_id: str, user
         out["video_url"] = video_url
     if changes.get("error"):
         out["error"] = changes["error"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Final cut — stitch masters + dialogue close-ups into one downloadable MP4
+# ---------------------------------------------------------------------------
+def _stitch_items(ep: dict) -> list:
+    """Ordered (storage_path, has_audio) for the episode's final cut: each scene's
+    establishing master (silent) first, then its READY dialogue close-ups (with voice)."""
+    manifest = ep.get("manifest") or {}
+    items = []
+    for s in manifest.get("scenes", []):
+        master = _master_clip(ep, s["scene_number"])
+        if master and master.get("status") == "READY" and master.get("storage_path"):
+            items.append((master["storage_path"], False))
+        for line in s.get("dialogue_lines", []):
+            shot = _line_shot(ep, s["scene_number"], line["line_id"])
+            if shot and shot.get("status") == "READY" and shot.get("storage_path"):
+                items.append((shot["storage_path"], True))
+    return items
+
+
+async def _run_stitch(episode_id: str, user_id: str, items: list, orientation: str):
+    try:
+        blobs = []
+        for path, has_audio in items:
+            data, _ = await core.load_bytes(path)
+            blobs.append((data, has_audio))
+        out = await run_in_threadpool(pipeline.stitch_episode, blobs, orientation)
+        path = await core.store_bytes(user_id, out, "mp4", "video/mp4")
+        await core.db.episodes.update_one({"id": episode_id}, {"$set": {"export": {
+            "status": "READY", "error": None, "storage_path": path, "updated_at": core.now_iso()}}})
+    except Exception as e:  # ffmpeg / storage failure — surface a retryable error
+        await core.db.episodes.update_one({"id": episode_id}, {"$set": {"export": {
+            "status": "FAILED", "error": str(e)[:300], "storage_path": None, "updated_at": core.now_iso()}}})
+
+
+@router.post("/projects/{project_id}/episodes/{n}/stitch")
+async def start_stitch(project_id: str, n: int, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    items = _stitch_items(ep)
+    if not items:
+        raise HTTPException(status_code=400, detail="Generate at least one motion clip or dialogue shot first")
+    if (ep.get("export") or {}).get("status") == "PROCESSING":
+        return {"status": "PROCESSING"}
+    await ep_update(ep["id"], {"export": {"status": "PROCESSING", "error": None,
+                                          "storage_path": None, "updated_at": core.now_iso()}})
+    asyncio.create_task(_run_stitch(ep["id"], user["id"], items, series.get("orientation", "vertical")))
+    return {"status": "PROCESSING", "shots": len(items)}
+
+
+@router.get("/projects/{project_id}/episodes/{n}/stitch")
+async def poll_stitch(project_id: str, n: int, user: core.CurrentUser):
+    series, ep = await _load_pipeline_episode(project_id, n, user)
+    exp = ep.get("export") or {}
+    out = {"status": exp.get("status", "NONE")}
+    if exp.get("status") == "READY" and exp.get("storage_path"):
+        out["download_url"] = core.media_url(exp["storage_path"])
+    if exp.get("error"):
+        out["error"] = exp["error"]
     return out
 
 

@@ -3,10 +3,30 @@ import * as api from '@/src/services/api';
 import { Image } from 'expo-image';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Modal, Pressable, ScrollView, Text, View } from 'react-native';
+import { ActivityIndicator, Linking, Modal, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useVideoPlayer, VideoView } from 'expo-video';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
+
+async function downloadVideo(url: string, filename: string) {
+  if (Platform.OS === 'web') {
+    await Linking.openURL(url);
+    return;
+  }
+  try {
+    const target = `${FileSystem.cacheDirectory}${filename}`;
+    const { uri } = await FileSystem.downloadAsync(url, target);
+    if (await Sharing.isAvailableAsync()) {
+      await Sharing.shareAsync(uri, { mimeType: 'video/mp4', dialogTitle: 'Save or share your episode' });
+    } else {
+      await Linking.openURL(url);
+    }
+  } catch {
+    await Linking.openURL(url);
+  }
+}
 
 const STEPS = ['Synopsis', 'Script', 'Assets', 'Story', 'Motion', 'Voice', 'Lip-sync', 'Preview'];
 const PURPLE = '#8B5CF6';
@@ -472,7 +492,7 @@ export default function Pipeline() {
           )}
 
           {currentStep === 8 && (
-            <PreviewStep ep={ep} ratio={ratio} onPlay={() => setPlaying(true)} />
+            <PreviewStep ep={ep} ratio={ratio} projectId={projectId} n={n} onPlay={() => setPlaying(true)} />
           )}
         </ScrollView>
       )}

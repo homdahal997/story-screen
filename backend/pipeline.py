@@ -7,10 +7,14 @@ via Gemini Nano Banana, motion via Replicate Luma Ray 3.2, voices via ElevenLabs
 import asyncio
 import base64
 import json
+import os
 import re
+import subprocess
+import tempfile
 import time
 from typing import Optional
 
+import imageio_ffmpeg
 import requests
 from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
 
@@ -472,3 +476,56 @@ def synthesize_voice(voice_id: str, text: str) -> bytes:
     if not r.ok:
         raise ProviderError("ElevenLabs could not synthesize this line. Retry shortly.")
     return r.content
+
+
+# ---------------------------------------------------------------------------
+# Final cut — stitch the episode's shots (establishing masters + dialogue
+# close-ups, in order) into one downloadable MP4 with audio. Uses a bundled
+# static ffmpeg (imageio-ffmpeg) — no AI credits, works in dev and production.
+# ---------------------------------------------------------------------------
+def _ffmpeg_exe() -> str:
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def stitch_episode(clips: list, orientation: str) -> bytes:
+    """clips: ordered list of (mp4_bytes, has_audio). Masters are silent (has_audio
+    False) and get a silent track; dialogue close-ups keep their voice audio. Every
+    clip is normalized to a common canvas + 24fps + stereo AAC so the concat is clean."""
+    if not clips:
+        raise RuntimeError("Nothing to stitch yet.")
+    w, h = (1280, 720) if orientation == "horizontal" else (720, 1280)
+    vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+          f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=24,format=yuv420p")
+    ff = _ffmpeg_exe()
+    with tempfile.TemporaryDirectory() as td:
+        norm_files = []
+        for i, (data, has_audio) in enumerate(clips):
+            src = os.path.join(td, f"src{i}.mp4")
+            out = os.path.join(td, f"norm{i}.mp4")
+            with open(src, "wb") as f:
+                f.write(data)
+            common = ["-vf", vf, "-r", "24", "-c:v", "libx264", "-preset", "veryfast",
+                      "-crf", "23", "-c:a", "aac", "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                      "-shortest", out]
+            if has_audio:
+                cmd = [ff, "-y", "-i", src, "-map", "0:v:0", "-map", "0:a:0"] + common
+            else:
+                cmd = [ff, "-y", "-i", src, "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                       "-map", "0:v:0", "-map", "1:a:0"] + common
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if r.returncode != 0 or not os.path.exists(out):
+                raise RuntimeError(f"Could not normalize clip {i + 1}: {(r.stderr or '')[-300:]}")
+            norm_files.append(out)
+        list_path = os.path.join(td, "concat.txt")
+        with open(list_path, "w") as f:
+            for nf in norm_files:
+                f.write(f"file '{nf}'\n")
+        final = os.path.join(td, "final.mp4")
+        cmd = [ff, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-ar", "44100", "-movflags", "+faststart", final]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or not os.path.exists(final):
+            raise RuntimeError(f"Could not assemble the final cut: {(r.stderr or '')[-300:]}")
+        with open(final, "rb") as f:
+            return f.read()

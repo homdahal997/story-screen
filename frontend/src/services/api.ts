@@ -112,6 +112,7 @@ export interface Episode {
   characters: EpisodeCharacter[];
   scenes: EpisodeScene[];
   preview: { shots: PreviewShot[]; total_seconds: number };
+  export: { status: string; download_url?: string; error?: string };
   series_title: string;
 }
 
@@ -243,6 +244,15 @@ export function startShot(projectId: string, n: number, sceneNumber: number, lin
 export function pollShot(projectId: string, n: number, sceneNumber: number, lineId: string) {
   return request<{ scene_number: number; line_id: string; status: RenderStatus; video_url?: string; error?: string }>(
     `${epPath(projectId, n)}/scenes/${sceneNumber}/lines/${lineId}/shot`);
+}
+
+// ---- Final cut (server-side stitch to one downloadable MP4) ----
+export function startStitch(projectId: string, n: number) {
+  return request<{ status: string; shots?: number }>(`${epPath(projectId, n)}/stitch`, { method: 'POST' });
+}
+
+export function pollStitch(projectId: string, n: number) {
+  return request<{ status: string; download_url?: string; error?: string }>(`${epPath(projectId, n)}/stitch`);
 }
 
 // ---- Featured ----
